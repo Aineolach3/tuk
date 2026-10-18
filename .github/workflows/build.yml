@@ -13,21 +13,24 @@ jobs:
     env:
       NDK_VERSION: 27.0.12077973
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
 
-      - uses: android-actions/setup-android@v3
-
+      # Android SDK уже установлен на серверах GitHub, доставляем NDK и платформу
       - name: Android NDK и платформа
-        run: sdkmanager "ndk;${NDK_VERSION}" "platforms;android-34" "build-tools;34.0.0"
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "ndk;${NDK_VERSION}" "platforms;android-34" "build-tools;34.0.0"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -60,11 +63,11 @@ jobs:
     name: Установщик для Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
 
       - uses: dtolnay/rust-toolchain@stable
 
