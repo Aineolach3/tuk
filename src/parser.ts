@@ -5,7 +5,7 @@ import type { Metric, Repeat } from './model.js';
 
 export type Parsed =
   | { type: 'reminder'; text: string; dueAt: number; repeat: Repeat | null; tag?: string }
-  | { type: 'task'; text: string; dueAt: number | null; allDay: boolean; reason?: 'no-time' }
+  | { type: 'task'; text: string; dueAt: number | null; allDay: boolean; reason?: 'no-time'; explicit?: boolean }
   | { type: 'note'; text: string }
   | { type: 'health'; records: { metric: Metric; value: number; value2?: number; unit: string }[]; text: string }
   | { type: 'done'; query: string }
@@ -398,7 +398,7 @@ export function parse(input: string, now: Date = new Date()): Parsed {
       if (due <= now.getTime()) due = Math.ceil((now.getTime() + HOUR) / (5 * MIN)) * 5 * MIN;
       return { type: 'reminder', text: text || 'Напоминание', dueAt: due, repeat: w.repeat, tag };
     }
-    return { type: 'task', text: text || 'Без названия', dueAt: null, allDay: false, reason: 'no-time' };
+    return { type: 'task', text: text || 'Без названия', dueAt: null, allDay: false, reason: 'no-time', explicit: true };
   }
 
   if (DONE_TRIGGER.test(s)) return { type: 'done', query: s.replace(DONE_TRIGGER, '').trim() };
@@ -411,6 +411,7 @@ export function parse(input: string, now: Date = new Date()): Parsed {
   if (health.length) return { type: 'health', records: health, text: input.trim() };
 
   // Задача или напоминание по наличию времени
+  const explicit = TASK_TRIGGER.test(s);
   const body = blank(s, TASK_TRIGGER);
   const w = extractWhen(body, now, o);
   const text = cleanText(w.rest);
@@ -418,8 +419,8 @@ export function parse(input: string, now: Date = new Date()): Parsed {
     const tag = /таблет|лекарств|витамин|капл|укол/.test(text.toLowerCase()) ? 'здоровье' : undefined;
     return { type: 'reminder', text: text || 'Напоминание', dueAt: w.date.getTime(), repeat: w.repeat, tag };
   }
-  if (w.date) return { type: 'task', text: text || 'Без названия', dueAt: startOfDay(w.date).getTime(), allDay: true };
-  return { type: 'task', text: cleanText(restore(body, o)) || 'Без названия', dueAt: null, allDay: false };
+  if (w.date) return { type: 'task', text: text || 'Без названия', dueAt: startOfDay(w.date).getTime(), allDay: true, explicit: true };
+  return { type: 'task', text: cleanText(restore(body, o)) || 'Без названия', dueAt: null, allDay: false, explicit };
 }
 
 // ---------------- Форматирование ----------------

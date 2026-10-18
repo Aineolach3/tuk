@@ -9,8 +9,9 @@ import { Link, ago } from './link.js';
 import { qrSvg } from './qr.js';
 import * as R from './reminders.js';
 import { randomKey } from './crypto.js';
+import { Brain, MODELS, systemPrompt, type BrainState, type ChatMsg, type ModelId } from './brain.js';
 
-type Tab = 'today' | 'tasks' | 'reminders' | 'health' | 'notes' | 'settings';
+type Tab = 'today' | 'chat' | 'tasks' | 'reminders' | 'health' | 'notes' | 'settings';
 
 const $ = <T extends HTMLElement = HTMLElement>(s: string) => document.querySelector(s) as T;
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
@@ -36,10 +37,20 @@ class App {
   pinTimer: ReturnType<typeof setInterval> | null = null;
   found: P.Found[] = [];
   lastHtml = '';
+  brain: Brain;
+  generating = false;
+  streamText = '';
+  chatAbort: AbortController | null = null;
+  lastBrainRender = 0;
 
   constructor(data: Data) {
     this.store = new Store(data, P.saveData);
     this.link = new Link(this.store);
+    const st = data.settings;
+    st.model ??= P.kind === 'desktop' ? 'smart' : 'lite';
+    st.usePcBrain ??= true;
+    this.brain = new Brain(st.model);
+    this.brain.onState = (b) => this.onBrainState(b);
     this.char = new Character($<HTMLCanvasElement>('#char'));
     document.documentElement.classList.add(P.kind);
     if (P.kind === 'web') document.documentElement.classList.add('android-like');
@@ -59,6 +70,9 @@ class App {
   }
 
   async start(): Promise<void> {
+    // ПК отвечает телефону своим мозгом
+    this.link.chatHandler = (messages) => (this.brain.ready ? this.brain.chat(messages, () => {}) : Promise.reject(new Error('Мозг на ПК не загружен')));
+    void this.brain.init();
     if (P.kind === 'desktop') await this.link.startServer();
     else if (P.kind === 'android') this.link.startClient();
     await R.syncAndroidSchedule(this.store);
@@ -154,6 +168,17 @@ class App {
     this.activity();
     const p = parse(text);
     if (p.type === 'empty') return;
+    const question = /\?\s*$/.test(text.trim());
+    // «купить хлеб», «позвонить маме» — дело; остальное без явной команды — разговор
+    const todo = !question && /^[а-яё-]+(ть|ти|чь|ться|тись)(\s|$)/i.test(text.trim());
+    const chatty = !todo && ((p.type === 'task' && !p.explicit && p.dueAt == null) || p.type === 'greet');
+    if (chatty) {
+      if (this.canTalk()) return this.converse(text);
+      if (p.type !== 'greet') {
+        this.setTab('chat');
+        return this.say('Чтобы разговаривать, мне нужен мозг — его можно скачать во вкладке «Чат». А задачи записываю и так: «запиши …».', 'think', 6000);
+      }
+    }
     this.flash('think', 500);
     await new Promise((r) => setTimeout(r, 450));
     const s = this.store;
@@ -209,6 +234,176 @@ class App {
         this.say('Например: «напомни завтра в 9 позвонить», «запиши купить кабель», «давление 125 на 80», «готово кабель».', 'idle', 9000);
         break;
     }
+  }
+
+  // ---------------- Разговор ----------------
+
+  /** Есть ли чем думать: свой мозг или мозг ПК (для телефона). */
+  canTalk(): boolean {
+    return this.brain.ready || (P.kind === 'android' && this.link.linked && !!this.store.data.settings.usePcBrain);
+  }
+
+  contextText(): string {
+    const now = Date.now();
+    const s = this.store;
+    const d = new Date(now);
+    const lines: string[] = [];
+    lines.push(`Сейчас: ${d.toLocaleDateString('ru-RU', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}, ${fmtTime(now)}.`);
+    const tasks = s.items.filter((i) => i.kind === 'task' && !i.done).slice(0, 12);
+    lines.push(tasks.length ? 'Открытые дела:\n' + tasks.map((t) => `- ${t.text}${t.dueAt ? ` (на ${fmtDay(t.dueAt)})` : ''}`).join('\n') : 'Открытых дел нет.');
+    const rem = R.activeReminders(s).sort((a, b) => a.dueAt! - b.dueAt!).slice(0, 10);
+    lines.push(rem.length ? 'Напоминания:\n' + rem.map((r) => `- ${fmtWhen(r.dueAt!)} — ${r.text}${r.repeat ? ` (${REPEAT_LABEL[r.repeat]})` : ''}`).join('\n') : 'Напоминаний нет.');
+    const done = s.items.filter((i) => i.done && (i.doneAt ?? 0) >= startOfDay()).map((i) => i.text);
+    if (done.length) lines.push('Сделано сегодня: ' + done.join('; ') + '.');
+    const latest = this.latestHealth();
+    const h = (Object.keys(latest) as Metric[]).map((m) => `${METRIC_LABEL[m].toLowerCase()} ${healthText(latest[m]!.health!)} (${fmtDay(latest[m]!.createdAt)})`);
+    if (h.length) lines.push('Последние записи здоровья: ' + h.join(', ') + '.');
+    const notes = s.items.filter((i) => i.kind === 'note').sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
+    if (notes.length) lines.push('Заметки:\n' + notes.map((n) => `- ${n.text}`).join('\n'));
+    return lines.join('\n');
+  }
+
+  async converse(text: string): Promise<void> {
+    if (this.generating) return this.say('Секунду, ещё думаю над прошлым ответом…', 'think', 2000);
+    const d = this.store.data;
+    const chat = (d.chat ??= []);
+    chat.push({ role: 'user', content: text.trim() });
+    if (chat.length > 60) chat.splice(0, chat.length - 60);
+    this.store.changed('chat');
+    this.setTab('chat');
+
+    const messages: ChatMsg[] = [{ role: 'system', content: systemPrompt(d.settings.name, this.contextText()) }, ...chat.slice(-12)];
+    this.generating = true;
+    this.streamText = '';
+    this.chatAbort = new AbortController();
+    this.tempMood = 'think';
+    this.tempUntil = Date.now() + 600_000;
+    this.char.set('think');
+    this.renderChatLive();
+    let answer = '';
+    try {
+      const pcFirst = P.kind === 'android' && this.link.linked && d.settings.usePcBrain;
+      if (pcFirst) {
+        try {
+          answer = await this.link.askPc(messages);
+        } catch (e) {
+          if (!this.brain.ready) throw new Error('ПК не ответил, а своего мозга на телефоне пока нет. Скачайте его во вкладке «Чат».');
+        }
+      }
+      if (!answer) {
+        answer = await this.brain.chat(
+          messages,
+          (full) => {
+            if (!this.streamText) this.flash('listen', 600_000);
+            this.streamText = full;
+            this.renderChatLive();
+          },
+          this.chatAbort.signal,
+        );
+      }
+      answer = answer.trim() || '…';
+      chat.push({ role: 'assistant', content: answer });
+      this.store.changed('chat');
+      this.flash('happy', 1500);
+      this.say(answer, null, Math.min(30_000, 4000 + answer.length * 60));
+    } catch (e) {
+      const msg = this.chatAbort?.signal.aborted ? 'Хорошо, остановился.' : String((e as Error).message ?? e);
+      if (this.streamText) chat.push({ role: 'assistant', content: this.streamText.trim() });
+      this.say(msg, this.chatAbort?.signal.aborted ? 'idle' : 'think', 4000);
+    } finally {
+      this.generating = false;
+      this.streamText = '';
+      this.chatAbort = null;
+      if (this.tempMood === 'think' || this.tempMood === 'listen') this.tempMood = null;
+      this.lastHtml = '';
+      this.render();
+    }
+  }
+
+  /** Обновить только «печатающийся» пузырь, без перерисовки всей вкладки. */
+  renderChatLive(): void {
+    const el = document.querySelector('#stream-bubble');
+    if (el) {
+      el.textContent = this.streamText || '…';
+      const v = $('#view');
+      v.scrollTop = v.scrollHeight;
+    } else if (this.tab === 'chat') {
+      this.lastHtml = '';
+      this.render();
+    }
+    if (this.streamText) {
+      this.reply = this.streamText;
+      this.replyUntil = Date.now() + 60_000;
+      this.renderReply();
+      this.renderBar();
+    }
+  }
+
+  onBrainState(b: BrainState): void {
+    const now = Date.now();
+    if (b.s === 'downloading' && now - this.lastBrainRender < 400) return;
+    this.lastBrainRender = now;
+    if (b.s === 'ready' && this.tab === 'chat') this.say('Мозг загружен — давайте поговорим!', 'happy', 3000);
+    if (this.tab === 'chat' || this.tab === 'settings') {
+      this.lastHtml = '';
+      this.render();
+    }
+  }
+
+  brainHtml(full = false): string {
+    const b = this.brain.state;
+    const m = this.brain.model;
+    const gb = (n: number) => (n / 1e9).toFixed(1).replace('.', ',') + ' ГБ';
+    let body = '';
+    switch (b.s) {
+      case 'ready':
+        body = `<div><b>Мозг: ${esc(m.name)}</b> <span class="muted">· ${esc(m.about)}</span></div>`;
+        break;
+      case 'absent':
+        body = `<p>Чтобы разговаривать, мне нужен мозг — нейросеть <b>${esc(m.name)}</b> (${gb(m.bytes)}). Она скачается один раз по Wi-Fi, дальше я думаю без интернета.</p>
+          <button class="pill big" data-act="brain-download">Скачать мозг · ${gb(m.bytes)}</button>`;
+        break;
+      case 'downloading': {
+        const pct = Math.min(100, Math.round((b.done / (b.total || m.bytes)) * 100));
+        body = `<div>Скачиваю мозг: <b>${pct}%</b> <span class="muted">${gb(b.done)} из ${gb(b.total || m.bytes)}</span></div><div class="bar-progress"><i style="width:${pct}%"></i></div><p class="muted">Можно пользоваться Туком как обычно. Если связь прервётся — нажмите «Скачать» ещё раз.</p>`;
+        break;
+      }
+      case 'loading':
+        body = '<div>Загружаю мозг в память… <span class="muted">это до минуты</span></div><div class="bar-progress busy"><i></i></div>';
+        break;
+      case 'error':
+        body = `<div class="err">${esc(b.why)}</div><button class="pill" data-act="brain-download">Попробовать ещё раз</button>`;
+        break;
+      case 'unavailable':
+        body = `<div class="err">Нейросеть не запускается на этом устройстве: ${esc(b.why)}</div>`;
+        break;
+    }
+    if (full) {
+      const choice = (Object.keys(MODELS) as ModelId[])
+        .map((id) => `<button class="pill ${id === m.id ? '' : 'ghost'} small" data-act="set-model" data-id="${id}">${esc(MODELS[id].name)} · ${gb(MODELS[id].bytes)}</button>`)
+        .join('');
+      body += `<div class="row">${choice}</div><p class="muted small">«Лёгкий» быстрее, «Умный» лучше понимает. Нужно около ${P.kind === 'android' ? '2–3' : '3–4'} ГБ свободной памяти.</p>`;
+      if (b.s === 'ready') body += '<button class="pill ghost small" data-act="brain-forget">Удалить мозг с устройства</button>';
+      if (P.kind === 'android') body += `<label class="toggle"><input type="checkbox" id="set-usepc" ${this.store.data.settings.usePcBrain ? 'checked' : ''}> Думать головой ПК, когда он в той же сети (умнее)</label>`;
+    }
+    return `<div class="card brain">${body}</div>`;
+  }
+
+  chatHtml(): string {
+    const chat = this.store.data.chat ?? [];
+    const head = this.brain.ready ? '' : this.canTalk() ? '<p class="muted small">Отвечает мозг ПК. Свой мозг на телефоне можно скачать в ⚙.</p>' : this.brainHtml();
+    const bubbles = chat
+      .slice(-40)
+      .map((m) => `<div class="msg ${m.role === 'user' ? 'me' : 'tuk'}">${esc(m.content)}</div>`)
+      .join('');
+    const live = this.generating ? `<div class="msg tuk live" id="stream-bubble">${esc(this.streamText || '…')}</div>` : '';
+    const empty = !chat.length && !this.generating
+      ? `<p class="muted">Просто напишите что-нибудь: «как дела?», «что у меня завтра?», «посоветуй, с чего начать день». Команды вроде «напомни…» и «запиши…» работают как раньше.</p>`
+      : '';
+    const tools = this.generating
+      ? '<button class="pill ghost small" data-act="chat-stop">Остановить</button>'
+      : chat.length ? '<button class="pill ghost small" data-act="chat-clear">Новый разговор</button>' : '';
+    return `${head}<div class="chat">${bubbles}${live}</div>${empty}<div class="row">${tools}</div>`;
   }
 
   find(query: string, includeAll = false): StoredItem | undefined {
@@ -353,6 +548,7 @@ class App {
         st.autostart = t.checked;
         void P.setAutostart(t.checked);
       } else if (t.id === 'set-name') st.name = t.value.trim() || 'Тук';
+      else if (t.id === 'set-usepc') st.usePcBrain = t.checked;
       else if (t.id === 'set-device') this.store.data.deviceName = t.value.trim() || this.store.data.deviceName;
       else return;
       this.store.changed('settings');
@@ -464,6 +660,27 @@ class App {
       case 'tab':
         this.setTab(id as Tab);
         break;
+      case 'brain-download':
+        void this.brain.start();
+        break;
+      case 'brain-forget':
+        if (confirm('Удалить мозг с устройства? Чтобы снова разговаривать, его придётся скачать заново.')) await this.brain.forget();
+        break;
+      case 'set-model':
+        if (this.store.data.settings.model !== id) {
+          this.store.data.settings.model = id as ModelId;
+          this.store.changed('settings');
+          await this.brain.switchModel(id as ModelId);
+        }
+        break;
+      case 'chat-stop':
+        this.chatAbort?.abort();
+        break;
+      case 'chat-clear':
+        this.store.data.chat = [];
+        this.store.changed('chat');
+        this.say('Начнём сначала. О чём поговорим?', 'happy', 2500);
+        break;
     }
   }
 
@@ -526,7 +743,8 @@ class App {
   renderReply(): void {
     const r = $('#reply');
     r.textContent = this.reply;
-    r.classList.toggle('show', !!this.reply);
+    // в чате ответ и так виден в переписке
+    r.classList.toggle('show', !!this.reply && this.tab !== 'chat');
   }
 
   renderStatus(): void {
@@ -573,6 +791,8 @@ class App {
     switch (this.tab) {
       case 'today':
         return this.todayHtml();
+      case 'chat':
+        return this.chatHtml();
       case 'tasks':
         return this.tasksHtml();
       case 'reminders':
@@ -729,6 +949,7 @@ class App {
     }
     const moods = (Object.keys(MOOD_LABEL) as Mood[]).map((m) => `<button class="pill ghost small" data-act="preview" data-mood="${m}">${MOOD_LABEL[m]}</button>`).join('');
     return `<h3>Связь ${P.kind === 'android' ? 'с ПК' : 'с телефоном'}</h3>${link}
+      <h3>Мозг</h3>${this.brainHtml(true)}
       <h3>Помощник</h3>
       <label class="field"><span>Имя помощника</span><input id="set-name" value="${esc(st.name)}"></label>
       <label class="field"><span>Имя этого устройства</span><input id="set-device" value="${esc(d.deviceName)}"></label>

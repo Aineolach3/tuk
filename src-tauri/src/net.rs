@@ -12,6 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const BEACON_PORT: u16 = 47801;
+/// Сколько сервер ждёт ответа интерфейса (ответ мозга может идти долго).
+pub static REPLY_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(180);
 const MAX_HEADER: usize = 64 * 1024;
 const MAX_BODY: usize = 32 * 1024 * 1024;
 
@@ -62,8 +64,8 @@ fn handle_conn<F>(mut stream: TcpStream, srv: &Server, on_request: &F) -> std::i
 where
     F: Fn(u64, String, String),
 {
-    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let (head, mut body) = read_head(&mut stream)?;
     let mut lines = head.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
@@ -90,7 +92,7 @@ where
     let (tx, rx) = channel();
     srv.pending.lock().unwrap().insert(id, tx);
     on_request(id, path, String::from_utf8_lossy(&body).into_owned());
-    let (status, text) = match rx.recv_timeout(Duration::from_secs(20)) {
+    let (status, text) = match rx.recv_timeout(Duration::from_secs(REPLY_TIMEOUT_SECS.load(Ordering::Relaxed))) {
         Ok(r) => r,
         Err(_) => {
             srv.pending.lock().unwrap().remove(&id);
@@ -168,7 +170,7 @@ pub fn http_post(host: &str, port: u16, path: &str, body: &str) -> Result<String
         .next()
         .ok_or_else(|| format!("Неверный адрес {host}"))?;
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(4)).map_err(|e| format!("Нет связи с {host}:{port} ({e})"))?;
-    s.set_read_timeout(Some(Duration::from_secs(25))).ok();
+    s.set_read_timeout(Some(Duration::from_secs(200))).ok();
     s.set_write_timeout(Some(Duration::from_secs(15))).ok();
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -315,11 +317,12 @@ mod tests {
     #[test]
     fn server_timeout_gives_503() {
         // никто не отвечает — клиент получает 503, а не зависает навсегда
+        REPLY_TIMEOUT_SECS.store(2, Ordering::Relaxed);
         let srv = start_server(0, |_, _, _| {}).unwrap();
         let t = Instant::now();
         let e = http_post("127.0.0.1", srv.port, "/sync", "{}").unwrap_err();
         assert!(e.starts_with("503"), "{e}");
-        assert!(t.elapsed() < Duration::from_secs(25));
+        assert!(t.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

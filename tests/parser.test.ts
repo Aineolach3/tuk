@@ -97,6 +97,9 @@ test('задачи', () => {
   assert.equal((p as any).reason, 'no-time');
   p = parse('купить 5 метров гофры', NOW);
   assert.equal(p.type, 'task');
+  assert.equal((p as any).explicit, false);
+  assert.equal((parse('запиши купить хлеб', NOW) as any).explicit, true);
+  assert.equal((parse('как дела', NOW) as any).explicit, false);
 });
 
 test('здоровье', () => {

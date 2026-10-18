@@ -204,3 +204,16 @@ footer { flex: none; padding: 6px 14px calc(8px + env(safe-area-inset-bottom, 0p
 .link-status.error::before { background: var(--warn); }
 
 @media (prefers-reduced-motion: reduce) { #reply { animation: none; } }
+
+/* ---------- Чат ---------- */
+.chat { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; }
+.msg { max-width: 86%; padding: 9px 12px; border-radius: 16px; font-size: 14.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.me { align-self: flex-end; background: var(--accent); color: var(--accent-ink); border-bottom-right-radius: 5px; }
+.msg.tuk { align-self: flex-start; background: var(--card2); border-bottom-left-radius: 5px; }
+.msg.live { box-shadow: 0 0 0 1px rgba(244,196,112,0.35); }
+.card.brain { margin-top: 10px; }
+.card.brain p { margin: 8px 0; }
+.bar-progress { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin: 8px 0; }
+.bar-progress i { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.3s; }
+.bar-progress.busy i { width: 35%; animation: busy 1.2s ease-in-out infinite; }
+@keyframes busy { from { transform: translateX(-100%); } to { transform: translateX(300%); } }

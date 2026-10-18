@@ -3,6 +3,7 @@
 import * as P from './platform.js';
 import type { Store } from './store.js';
 import { randomKey, randomPin } from './crypto.js';
+import type { ChatMsg } from './brain.js';
 import {
   SYNC_PORT, clientApply, clientRequest, makePairCode, open, pinAccept, pinAnswer, pinRequest,
   readPairCode, seal, serverHandle, type SyncRequest, type SyncResponse,
@@ -18,6 +19,8 @@ export class Link {
   private busy = false;
   onStatus: (s: LinkStatus) => void = () => {};
   onRemoteChange: (n: number) => void = () => {};
+  /** ПК: ответить телефону своим мозгом (null — мозг не готов). */
+  chatHandler: ((messages: ChatMsg[]) => Promise<string>) | null = null;
 
   constructor(private store: Store) {}
 
@@ -64,6 +67,16 @@ export class Link {
         this.store.changed('sync');
         this.refreshServerStatus();
         return P.serverReply(req.id, 200, await seal(d.sync.key!, d.deviceId, resp));
+      }
+      if (req.path === '/chat') {
+        const { payload } = await open<{ messages: ChatMsg[] }>(d.sync.key!, req.body);
+        if (!this.chatHandler) return P.serverReply(req.id, 503, 'Мозг на ПК не загружен');
+        try {
+          const text = await this.chatHandler(payload.messages);
+          return P.serverReply(req.id, 200, await seal(d.sync.key!, d.deviceId, { text }));
+        } catch (e) {
+          return P.serverReply(req.id, 503, String((e as Error).message ?? e));
+        }
       }
       if (req.path === '/pair') {
         const pin = this.pin;
@@ -155,6 +168,16 @@ export class Link {
     } finally {
       this.busy = false;
     }
+  }
+
+  /** Телефон: спросить мозг ПК. Бросает исключение, если ПК недоступен или мозг там не загружен. */
+  async askPc(messages: ChatMsg[]): Promise<string> {
+    if (!this.linked) throw new Error('Телефон не связан с ПК');
+    const d = this.store.data;
+    const s = d.sync;
+    const body = await P.httpPost(s.host!, s.port ?? SYNC_PORT, '/chat', await seal(s.key!, d.deviceId, { messages }));
+    const { payload } = await open<{ text: string }>(s.key!, body);
+    return payload.text;
   }
 
   async pairByCode(code: string): Promise<void> {

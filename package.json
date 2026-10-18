@@ -12,5 +12,8 @@
     "@tauri-apps/cli": "^2",
     "tsx": "^4",
     "typescript": "^5"
+  },
+  "dependencies": {
+    "@wllama/wllama": "^3.0.0"
   }
 }

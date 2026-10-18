@@ -1,6 +1,7 @@
 // Хранилище записей. Сохранение на диск делает платформа (Rust-команда или localStorage в демо).
 
 import { type Item, newId } from './model.js';
+import type { ChatMsg, ModelId } from './brain.js';
 
 export type StoredItem = Item & { _rev?: number; _dirty?: boolean };
 
@@ -30,6 +31,8 @@ export interface Settings {
   sound: boolean;
   autostart: boolean;
   sleepAfterSec: number;
+  model?: ModelId; // какой мозг
+  usePcBrain?: boolean; // телефон: думать на ПК, когда он рядом
 }
 
 export interface Data {
@@ -41,6 +44,7 @@ export interface Data {
   fired: Record<string, number>; // id напоминания → dueAt, о котором уже напомнили (только на этом устройстве)
   sync: SyncState;
   settings: Settings;
+  chat?: ChatMsg[]; // история разговора (только на этом устройстве)
 }
 
 export function emptyData(deviceName: string): Data {
