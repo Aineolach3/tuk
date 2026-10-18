@@ -15,6 +15,7 @@
       <div id="bar-actions"></div>
       <span id="bar-badge"></span>
       <button id="gear" data-act="tab" data-id="settings" aria-label="Настройки">⚙</button>
+      <button id="full" data-act="drop-full" aria-label="Открыть всё приложение">⤢</button>
     </header>
     <main id="panel">
       <div id="reply" role="status" aria-live="polite"></div>
@@ -23,6 +24,7 @@
         <button type="button" id="attach" aria-label="Прикрепить файл">📎</button>
         <input type="file" id="file-input" hidden accept=".txt,.md,.csv,.json,.log,.pdf,.html,.xml,.yaml,.yml,.ini,.srt,text/*,application/pdf">
         <input id="input" enterkeyhint="send" placeholder="Что записать или о чём напомнить?" aria-label="Команда">
+        <button type="button" id="mic" aria-label="Сказать голосом" hidden><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" fill="currentColor"/><path d="M6 11a6 6 0 0 0 12 0M12 17v4M9 21h6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg></button>
         <button type="submit" aria-label="Отправить">↑</button>
       </form>
       <nav id="tabs">
@@ -38,6 +40,7 @@
       <footer><span id="link-status" class="link-status off"></span></footer>
     </main>
   </div>
+  <div id="scrim" data-act="drop-close"></div>
   <div id="overlay" hidden></div>
   <script type="module" src="app.js"></script>
 </body>

@@ -115,6 +115,7 @@ export class Character {
   private lastSpawn = 0;
   private light: number[] = LIGHT.idle;
   private raf = 0;
+  private clock = 0;
   private visible = true;
   /** Сдвиг вниз в долях высоты: в свёрнутой строке видна голова. */
   peek = 0;
@@ -123,12 +124,12 @@ export class Character {
   hood: number[] = HOOD_COLORS['Чёрный'];
   idleLight: number[] | null = null;
 
-  constructor(canvas: HTMLCanvasElement, opts: { still?: boolean } = {}) {
+  constructor(canvas: HTMLCanvasElement, opts: { still?: boolean; fixed?: boolean } = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d')!;
     if (opts.still) {
-      // картинка без анимации — для превью в гардеробе
-      this.resize();
+      // картинка без анимации — для превью в гардеробе; fixed — размер холста задан заранее
+      if (!opts.fixed) this.resize();
       this.nextWander = Infinity;
       this.nextBlink = Infinity;
       return;
@@ -141,6 +142,37 @@ export class Character {
       if (this.visible) this.loop();
     });
     this.loop();
+  }
+
+  /**
+   * Лист кадров (по горизонтали) для «острова» на Android — PNG в base64 без префикса.
+   * Рисуется тем же кодом, поэтому наряд и цвета совпадают с приложением.
+   */
+  static sheet(look: { outfit: Outfit; hood: number[]; light: number[] | null }, mood: Mood, frames: number, fps: number, size: number, peek = 0, zoom = 1.7): string {
+    // рисуем крупнее и берём верхнюю часть: на острове видны голова и антенна
+    const big = Math.round(size * zoom);
+    const one = document.createElement('canvas');
+    one.width = one.height = big;
+    const ch = new Character(one, { still: true, fixed: true });
+    ch.outfit = look.outfit;
+    ch.hood = look.hood;
+    ch.idleLight = look.light;
+    ch.peek = peek;
+    ch.mood = mood;
+    ch.since = -4000;
+    // разогрев: частицы (Zzz, ноты, сердечки) успевают появиться
+    for (let t = -3000; t < 0; t += 1000 / fps) ch.draw(t);
+    const out = document.createElement('canvas');
+    out.width = size * frames;
+    out.height = size;
+    const o = out.getContext('2d')!;
+    for (let i = 0; i < frames; i++) {
+      const now = (i * 1000) / fps;
+      if (mood !== 'sleep' && i === 3) ch.blinkUntil = now + 130;
+      ch.draw(now);
+      o.drawImage(one, (big - size) / 2, big * 0.04, size, size, i * size, 0, size, size);
+    }
+    return out.toDataURL('image/png').split(',')[1];
   }
 
   set(mood: Mood): void {
@@ -163,9 +195,10 @@ export class Character {
 
   private resize() {
     const dpr = window.devicePixelRatio || 1;
-    const r = this.canvas.getBoundingClientRect();
-    this.canvas.width = Math.max(1, Math.round(r.width * dpr));
-    this.canvas.height = Math.max(1, Math.round(r.height * dpr));
+    // clientWidth/Height не зависят от transform (анимации появления окна)
+    const w = this.canvas.clientWidth, h = this.canvas.clientHeight;
+    this.canvas.width = Math.max(1, Math.round(w * dpr));
+    this.canvas.height = Math.max(1, Math.round(h * dpr));
   }
 
   private loop = () => {
@@ -176,7 +209,7 @@ export class Character {
   };
 
   private spawn(p: Omit<Particle, 'born'>) {
-    this.particles.push({ ...p, born: performance.now() });
+    this.particles.push({ ...p, born: this.clock });
   }
 
   /** Яркость огонька 0..1 с учётом мигания. */
@@ -195,6 +228,7 @@ export class Character {
     const { ctx, canvas } = this;
     const W = canvas.width, H = canvas.height;
     ctx.clearRect(0, 0, W, H);
+    this.clock = now;
     const t = now / 1000;
     const age = (now - this.since) / 1000;
     const m = this.mood;
@@ -564,7 +598,7 @@ export class Character {
         ctx.stroke();
         continue;
       }
-      if (m === 'happy' || m === 'dance' || (m === 'eat' && (performance.now() - this.since) > 450)) {
+      if (m === 'happy' || m === 'dance' || (m === 'eat' && (this.clock - this.since) > 450)) {
         ctx.lineWidth = u * 0.075;
         ctx.beginPath();
         ctx.arc(x, y + u * 0.08, u * 0.12, Math.PI * 1.15, Math.PI * 1.85);

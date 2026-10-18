@@ -56,6 +56,8 @@ jobs:
           export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
           npx tauri android init --ci
           npx tauri icon src-tauri/icons/app-icon.png
+          node scripts/patch-android.mjs
+          find src-tauri/gen/android/app/src/main/res -name themes.xml -exec cat {} \;
           set -o pipefail
           if ! npx tauri android build --apk --debug --target aarch64 --ci 2>&1 | tee build.log; then
             # ошибки — в аннотации, чтобы их было видно без скачивания логов

@@ -251,3 +251,69 @@ export async function biometric(reason: string): Promise<boolean> {
 export async function quit(): Promise<void> {
   if (T) await invoke('quit_app');
 }
+
+// ---------------- Остров (Android) ----------------
+
+export interface IslandArgs {
+  mood?: string;
+  text?: string;
+  badge?: number;
+  data?: string;
+  frames?: number;
+  fps?: number;
+}
+
+/** Остров поверх приложений: check | grant | start | stop | update | sprite | consume | back. */
+export async function island(action: string, args: IslandArgs = {}): Promise<any> {
+  if (kind !== 'android') return null;
+  return invoke('plugin:tuk|island', { action, ...args });
+}
+
+// ---------------- Голос ----------------
+
+/** Можно ли говорить с Туком голосом на этом устройстве. */
+export function canListen(): boolean {
+  return kind === 'android';
+}
+
+/** Распознать фразу (Android: системный распознаватель, по возможности офлайн). */
+export async function hear(): Promise<string> {
+  if (kind !== 'android') throw new Error('Голосовой ввод на ПК появится в следующей версии');
+  const r = await invoke('plugin:tuk|listen', { action: 'start' });
+  return String(r?.text ?? '');
+}
+
+/** Промежуточный текст, пока человек говорит. */
+export async function listenPartial(): Promise<{ text: string; listening: boolean }> {
+  if (kind !== 'android') return { text: '', listening: false };
+  return invoke('plugin:tuk|listen', { action: 'partial' });
+}
+
+export async function listenStop(cancel = false): Promise<void> {
+  if (kind === 'android') await invoke('plugin:tuk|listen', { action: cancel ? 'cancel' : 'stop' });
+}
+
+/** Произнести текст; промис завершается, когда Тук договорил. */
+export async function speak(text: string): Promise<void> {
+  if (kind === 'android') {
+    await invoke('plugin:tuk|speak', { text });
+    return;
+  }
+  const ss = (globalThis as any).speechSynthesis as SpeechSynthesis | undefined;
+  if (!ss) return;
+  ss.cancel();
+  await new Promise<void>((res) => {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'ru-RU';
+    const v = ss.getVoices().find((x) => /^ru/i.test(x.lang));
+    if (v) u.voice = v;
+    u.onend = () => res();
+    u.onerror = () => res();
+    ss.speak(u);
+  });
+}
+
+export async function speakStop(): Promise<void> {
+  if (kind === 'android') await invoke('plugin:tuk|speak', { stop: true }).catch(() => {});
+  else (globalThis as any).speechSynthesis?.cancel();
+}

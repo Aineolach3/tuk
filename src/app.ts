@@ -14,6 +14,13 @@ import { Link, ago } from './link.js';
 import { qrSvg } from './qr.js';
 import * as R from './reminders.js';
 import { randomKey } from './crypto.js';
+
+/** Кадры острова: настроение, число кадров, кадров в секунду. */
+const ISLAND_MOODS: [Mood, number, number][] = [
+  ['idle', 32, 10], ['sleep', 24, 6], ['think', 16, 10], ['write', 16, 10], ['happy', 20, 14], ['angry', 16, 14],
+  ['alert', 16, 14], ['listen', 20, 10], ['dance', 24, 12], ['wave', 20, 12], ['poke', 12, 12],
+];
+const ISLAND_SPRITE_VERSION = ':2';
 import { Brain, MODELS, systemPrompt, type BrainState, type ChatMsg, type ModelId } from './brain.js';
 
 type Tab = 'today' | 'chat' | 'tasks' | 'reminders' | 'health' | 'notes' | 'agents' | 'settings';
@@ -57,6 +64,14 @@ class App {
   mediaTitle = '';
   mediaCover = '';
   petOpen = false;
+  islandOn = false;
+  islandKey = '';
+  spritesBusy = false;
+  awaitGrant = false;
+  drop = false;
+  voice: 'off' | 'listening' | 'speaking' = 'off';
+  voiceAsked = false;
+  voiceContinue = false;
   lastPet = '';
 
   constructor(data: Data) {
@@ -121,6 +136,29 @@ class App {
     } else if (P.kind === 'android') {
       this.link.startClient();
       setInterval(() => void this.pollAgents(), 3000);
+      void this.checkDrop();
+      document.addEventListener('visibilitychange', async () => {
+        if (document.hidden) {
+          if (this.voice === 'listening') void P.listenStop(true);
+          if (this.drop) {
+            this.drop = false;
+            document.documentElement.classList.remove('drop');
+          }
+          return;
+        }
+        await this.checkDrop();
+        if (this.awaitGrant) {
+          this.awaitGrant = false;
+          const c = await P.island('check').catch(() => null);
+          if (c?.granted) {
+            await this.startIsland();
+            this.say('Готово — я наверху экрана. Нажмите на меня в любом приложении.', 'wave', 5000);
+          } else this.say('Без разрешения «Поверх других приложений» я не смогу быть наверху экрана.', 'think', 5000);
+          this.lastHtml = '';
+          this.render();
+        }
+      });
+      void this.startIsland();
     }
     await R.syncAndroidSchedule(this.store);
     await P.askNotifyPermission().catch(() => {});
@@ -159,6 +197,10 @@ class App {
     if (P.kind === 'desktop' && this.mode === 'collapsed') this.applyMode('compact');
     this.renderBar();
     this.renderReply();
+    if (this.voiceAsked && text) {
+      this.voiceAsked = false;
+      void this.speakOut(text);
+    }
   }
 
   activity(): void {
@@ -197,6 +239,7 @@ class App {
       if (P.kind === 'desktop' && this.mode === 'compact' && !R.ringing(this.store).length && !this.hovering) this.applyMode('collapsed');
     }
     if (now % 15000 < 1000) this.renderBar();
+    this.pushIsland();
   }
 
   // ---------------- Режимы строки (ПК) ----------------
@@ -370,6 +413,7 @@ class App {
       this.store.changed('chat');
       this.flash('happy', 1500);
       this.sfx('message');
+      if (this.voiceAsked) this.voiceContinue = true;
       this.say(answer, null, Math.min(30_000, 4000 + answer.length * 60));
     } catch (e) {
       const msg = this.chatAbort?.signal.aborted ? 'Хорошо, остановился.' : String((e as Error).message ?? e);
@@ -530,6 +574,7 @@ class App {
 
   /** Наряд, цвет капюшона и огонька, громкость — из настроек. */
   applyLook(): void {
+    setTimeout(() => this.islandOn && void this.sendSprites(), 300);
     const st = this.store.data.settings;
     this.char.outfit = !st.outfit || st.outfit === 'auto' ? seasonalOutfit() : st.outfit;
     this.char.hood = HOOD_COLORS[st.hoodColor ?? 'Чёрный'] ?? HOOD_COLORS['Чёрный'];
@@ -799,6 +844,197 @@ class App {
     this.render();
   }
 
+  // ---------------- Остров (Android) ----------------
+
+  /** Включить остров при запуске, если он был включён. */
+  async startIsland(): Promise<void> {
+    if (P.kind !== 'android' || !this.store.data.settings.island) return;
+    try {
+      const st = await P.island('check');
+      if (!st?.granted) return;
+      if (!st.running) await P.island('start');
+      this.islandOn = true;
+      this.islandKey = '';
+      await this.sendSprites();
+      this.pushIsland();
+    } catch (e) {
+      console.warn('остров:', e);
+    }
+  }
+
+  async toggleIsland(on: boolean): Promise<void> {
+    const st = this.store.data.settings;
+    st.island = on;
+    this.store.changed('settings');
+    if (!on) {
+      await P.island('stop').catch(() => {});
+      this.islandOn = false;
+      this.say('Убрал Тука с верхней части экрана.', 'idle', 3000);
+    } else {
+      const c = await P.island('check').catch(() => null);
+      if (!c?.granted) {
+        this.awaitGrant = true;
+        this.say('Разрешите Туку «Поверх других приложений» и вернитесь сюда.', 'think', 8000);
+        await P.island('grant').catch(() => {});
+      } else {
+        await this.startIsland();
+        this.say('Я наверху экрана! Нажмите на меня в любом приложении.', 'wave', 4000);
+      }
+    }
+    this.lastHtml = '';
+    this.render();
+  }
+
+  /** Кадры анимации для острова — рисуются тем же кодом, в текущем наряде. */
+  async sendSprites(): Promise<void> {
+    const look = { outfit: this.char.outfit, hood: this.char.hood, light: this.char.idleLight };
+    const key = JSON.stringify(look) + ISLAND_SPRITE_VERSION;
+    if (this.store.data.islandLook === key || this.spritesBusy) return;
+    this.spritesBusy = true;
+    try {
+      for (const [mood, frames, fps] of ISLAND_MOODS) {
+        const data = Character.sheet(look, mood, frames, fps, 96);
+        await P.island('sprite', { mood, data, frames, fps });
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      this.store.data.islandLook = key;
+      this.store.changed('island');
+    } finally {
+      this.spritesBusy = false;
+    }
+  }
+
+  islandText(): string {
+    const now = Date.now();
+    const pend = this.agentPending();
+    if (pend.length) return 'Claude ждёт';
+    const ring = R.ringing(this.store, now);
+    if (ring.length) return ring[0].text;
+    if (this.voice === 'listening') return 'Слушаю…';
+    if (this.generating) return 'Думаю…';
+    const next = R.activeReminders(this.store)
+      .filter((i) => (i.dueAt ?? 0) > now)
+      .sort((a, b) => a.dueAt! - b.dueAt!)[0];
+    if (next && next.dueAt! - now < 60 * 60_000) return `${fmtTime(next.dueAt!)} ${next.text}`;
+    return '';
+  }
+
+  /** Передать острову настроение и текст (только когда что-то изменилось). */
+  pushIsland(): void {
+    if (!this.islandOn) return;
+    const st = { mood: this.char.mood, text: this.islandText(), badge: R.ringing(this.store).length + this.agentPending().length };
+    const key = JSON.stringify(st);
+    if (key === this.islandKey) return;
+    this.islandKey = key;
+    void P.island('update', st).catch(() => {});
+  }
+
+  /** Открыли нажатием на остров? Тогда — компактное выпадающее окно. */
+  async checkDrop(): Promise<void> {
+    if (P.kind !== 'android') return;
+    const r = await P.island('consume').catch(() => null);
+    if (r?.drop) this.enterDrop();
+  }
+
+  enterDrop(): void {
+    this.drop = true;
+    document.documentElement.classList.add('drop');
+    if (!['today', 'chat', 'tasks', 'reminders'].includes(this.tab)) this.setTab('today');
+    this.activity();
+    this.flash('wave', 1200);
+    this.sfx('hello');
+  }
+
+  exitDrop(back: boolean): void {
+    if (!this.drop) return;
+    this.drop = false;
+    document.documentElement.classList.remove('drop');
+    if (back) {
+      void P.speakStop();
+      void P.island('back');
+    }
+    this.render();
+  }
+
+  // ---------------- Голос ----------------
+
+  setVoice(v: 'off' | 'listening' | 'speaking'): void {
+    this.voice = v;
+    document.documentElement.classList.toggle('voice-listening', v === 'listening');
+    document.documentElement.classList.toggle('voice-speaking', v === 'speaking');
+    const mic = document.querySelector<HTMLElement>('#mic');
+    if (mic) mic.setAttribute('aria-label', v === 'listening' ? 'Закончить' : v === 'speaking' ? 'Замолчать' : 'Сказать голосом');
+    this.pushIsland();
+  }
+
+  /** Нажатие на микрофон: слушать → выполнить или ответить → произнести ответ. */
+  async voiceTurn(): Promise<void> {
+    if (this.voice === 'listening') return void P.listenStop();
+    if (this.voice === 'speaking') {
+      this.voiceContinue = false;
+      await P.speakStop();
+      return this.setVoice('off');
+    }
+    await P.speakStop();
+    this.activity();
+    this.setVoice('listening');
+    this.flash('listen', 60_000);
+    this.sfx('wake');
+    const input = $<HTMLInputElement>('#input');
+    const shown = input.placeholder;
+    input.placeholder = 'Говорите…';
+    const poll = setInterval(async () => {
+      const p = await P.listenPartial().catch(() => null);
+      if (p?.text) input.value = p.text;
+    }, 250);
+    let text = '';
+    try {
+      text = (await P.hear()).trim();
+    } catch (e) {
+      clearInterval(poll);
+      input.placeholder = shown;
+      this.setVoice('off');
+      this.tempMood = null;
+      const msg = String((e as Error).message ?? e);
+      if (!/Отменено/.test(msg)) this.say(msg, 'think', 6000);
+      return;
+    }
+    clearInterval(poll);
+    input.placeholder = shown;
+    input.value = '';
+    this.setVoice('off');
+    this.tempMood = null;
+    if (!text) return this.say('Не расслышал. Нажмите на микрофон и скажите ещё раз.', 'think', 3500);
+    this.voiceAsked = true;
+    this.voiceContinue = false;
+    await this.handleInput(text);
+    // ответ без голоса (например, ничего не сказано) — сбрасываем ожидание
+    setTimeout(() => (this.voiceAsked = false), 1500);
+  }
+
+  /** Произнести ответ; в разговоре — снова слушать. */
+  async speakOut(text: string): Promise<void> {
+    const clean = text
+      .replace(/[*_`#>]+/g, '')
+      .replace(/\p{Extended_Pictographic}/gu, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 1200);
+    if (!clean) return;
+    this.setVoice('speaking');
+    try {
+      await P.speak(clean);
+    } catch (e) {
+      console.warn('синтез речи:', e);
+    }
+    if (this.voice !== 'speaking') return; // остановили
+    this.setVoice('off');
+    if (this.voiceContinue && this.store.data.settings.voiceLoop !== false && (!this.drop || !document.hidden)) {
+      this.voiceContinue = false;
+      setTimeout(() => void this.voiceTurn(), 250);
+    }
+  }
+
   // ---------------- События ----------------
 
   bind(): void {
@@ -817,6 +1053,12 @@ class App {
 
     for (const ev of ['pointermove', 'pointerdown', 'keydown'] as const) document.addEventListener(ev, () => this.activity(), { passive: true });
     document.addEventListener('pointermove', (e) => this.char.lookAtScreen(e.clientX, e.clientY), { passive: true });
+
+    const mic = document.querySelector<HTMLElement>('#mic');
+    if (mic) {
+      mic.hidden = !P.canListen();
+      mic.addEventListener('click', () => void this.voiceTurn());
+    }
 
     $('#char').addEventListener('click', (e) => {
       if (P.kind === 'desktop' && this.mode === 'collapsed') return; // клик раскроет строку
@@ -896,6 +1138,7 @@ class App {
       } else if (t.id === 'set-name') st.name = t.value.trim() || 'Тук';
       else if (t.id === 'set-usepc') st.usePcBrain = t.checked;
       else if (t.id === 'set-dance') st.dance = t.checked;
+      else if (t.id === 'set-voiceloop') st.voiceLoop = t.checked;
       else if (t.id === 'set-volume') {
         st.volume = +t.value / 100;
         this.applyLook();
@@ -1038,6 +1281,14 @@ class App {
         await P.mediaControl(act === 'media-toggle' ? 'toggle' : act === 'media-next' ? 'next' : 'prev').catch(() => {});
         setTimeout(() => void this.pollMedia(), 400);
         break;
+      case 'island-on':
+        return this.toggleIsland(true);
+      case 'island-off':
+        return this.toggleIsland(false);
+      case 'drop-close':
+        return this.exitDrop(true);
+      case 'drop-full':
+        return this.exitDrop(false);
       case 'pet-on':
         await this.togglePet(true);
         break;
@@ -1400,6 +1651,13 @@ class App {
       <div class="card">${this.claudeHooks ? '<b>Подключён.</b> <span class="muted">Шаги и запросы разрешений — во вкладке «Агенты», на ПК и на телефоне.</span>' : '<span class="muted">Тук будет показывать, что делает Claude Code, и просить разрешения прямо в строке — на ПК и на телефоне.</span>'}
       <div class="row">${this.claudeHooks ? '<button class="pill ghost small" data-act="claude-off">Отключить</button>' : '<button class="pill small" data-act="claude-on">Подключить Claude Code</button>'}</div>
       <p class="muted small">Тук добавит свои хуки в ~/.claude/settings.json и сохранит копию файла. Ваши настройки не меняются.</p></div>` : ''}
+      ${P.kind === 'android' ? `<h3>Тук над приложениями</h3>
+      <div class="card">${st.island && this.islandOn ? '<b>Включён.</b> <span class="muted">Тук живёт вверху экрана, вокруг камеры. Нажатие — выпадающее окно, долгое нажатие — всё приложение.</span>' : '<span class="muted">Маленький анимированный Тук вверху экрана поверх любых приложений. Нажали — открылось небольшое окно: голос, записи, дела на сегодня.</span>'}
+      <div class="row">${st.island && this.islandOn ? '<button class="pill ghost small" data-act="island-off">Убрать</button>' : '<button class="pill small" data-act="island-on">Включить</button>'}</div>
+      <p class="muted small">Нужно разрешение «Поверх других приложений». В шторке появится тихое уведомление «Тук рядом» — так Android не выгружает Тука.</p></div>
+      <h3>Голос</h3>
+      <label class="toggle"><input type="checkbox" id="set-voiceloop" ${st.voiceLoop !== false ? 'checked' : ''}> Продолжать разговор после ответа</label>
+      <p class="muted small">Нажмите 🎤 и говорите. Без интернета распознавание работает, если скачан русский язык: Настройки → Общие настройки → Язык и ввод → Распознавание речи (или Google → Офлайн-распознавание). Голос Тука — системный синтез речи.</p>` : ''}
       <h3>Сводка</h3>
       <button class="pill ghost" data-act="recap">Сводка за неделю</button>
       ${P.kind === 'desktop' ? `<label class="toggle"><input type="checkbox" id="set-autostart" ${st.autostart ? 'checked' : ''}> Запускать вместе с Windows</label><p class="muted">Открыть строку: Ctrl+Alt+Пробел. Свернуть: Esc.</p>` : ''}

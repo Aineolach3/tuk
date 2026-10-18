@@ -1,0 +1,12 @@
+[package]
+name = "tauri-plugin-tuk"
+version = "0.1.0"
+edition = "2021"
+description = "Тук для Android: остров поверх приложений, распознавание и синтез речи"
+links = "tauri-plugin-tuk"
+
+[dependencies]
+tauri = "2"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }

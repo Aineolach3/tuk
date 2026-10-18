@@ -38,6 +38,8 @@ export interface Settings {
   hoodColor?: string;
   lightColor?: string;
   dance?: boolean; // танцевать под музыку
+  island?: boolean; // Android: Тук над приложениями
+  voiceLoop?: boolean; // продолжать разговор голосом после ответа
 }
 
 export interface Data {
@@ -51,6 +53,7 @@ export interface Data {
   settings: Settings;
   chat?: ChatMsg[]; // история разговора (только на этом устройстве)
   recapSeen?: string; // неделя, сводку за которую уже показали
+  islandLook?: string; // для какого наряда уже отправлены кадры острова
   agentRules?: import('./agents.js').Rule[]; // «разрешать всегда»
 }
 
