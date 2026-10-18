@@ -2,6 +2,8 @@
 //! файл с данными, окно-строка у верхнего края экрана, трей, горячая клавиша,
 //! сеть между ПК и телефоном. Вся логика помощника — в TypeScript (папка src).
 
+#[cfg(desktop)]
+mod desktop;
 mod net;
 
 use std::path::PathBuf;
@@ -112,6 +114,114 @@ fn save_image(app: AppHandle, name: String, base64: String) -> Result<String, St
     Err(last)
 }
 
+// ---------- Хуки Claude Code ----------
+
+/// Режим «шлюза»: Claude Code запускает `Tuk.exe --hook`, передаёт событие в stdin.
+/// Пересылаем его работающему Туку и печатаем его ответ (решение по разрешению).
+pub fn hook_main() -> i32 {
+    use std::io::{Read, Write};
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let blocking = input.contains("\"PermissionRequest\"");
+    let read_secs = if blocking { 115 } else { 3 };
+    if let Ok(body) = net::http_post_t("127.0.0.1", 47800, "/hook", &input, 1, read_secs) {
+        let t = body.trim();
+        if t.starts_with('{') {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(t.as_bytes());
+            let _ = out.flush();
+        }
+    }
+    0
+}
+
+#[tauri::command]
+fn claude_info() -> Result<String, String> {
+    #[cfg(desktop)]
+    return desktop::claude_info();
+    #[cfg(mobile)]
+    Err("Только на ПК".into())
+}
+
+#[tauri::command]
+fn claude_read() -> Result<String, String> {
+    #[cfg(desktop)]
+    return desktop::claude_read();
+    #[cfg(mobile)]
+    Err("Только на ПК".into())
+}
+
+#[tauri::command]
+fn claude_write(json: String) -> Result<String, String> {
+    #[cfg(desktop)]
+    return desktop::claude_write(&json);
+    #[cfg(mobile)]
+    {
+        let _ = json;
+        Err("Только на ПК".into())
+    }
+}
+
+// ---------- Питомец на рабочем столе ----------
+
+#[tauri::command]
+fn pet_show(app: AppHandle, show: bool) -> Result<(), String> {
+    #[cfg(desktop)]
+    return desktop::pet_show(&app, show);
+    #[cfg(mobile)]
+    {
+        let _ = (app, show);
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn pet_drag(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.start_dragging().map_err(err)
+}
+
+#[tauri::command]
+fn cursor_rel(window: tauri::WebviewWindow) -> Result<(f64, f64), String> {
+    #[cfg(desktop)]
+    return desktop::cursor_rel(&window);
+    #[cfg(mobile)]
+    {
+        let _ = window;
+        Ok((0.0, 0.0))
+    }
+}
+
+// ---------- Музыка ----------
+
+#[tauri::command]
+async fn media_info() -> Result<String, String> {
+    #[cfg(windows)]
+    return tauri::async_runtime::spawn_blocking(desktop::media::info).await.map_err(err)?;
+    #[cfg(not(windows))]
+    Ok("null".into())
+}
+
+#[tauri::command]
+async fn media_thumb() -> Result<String, String> {
+    #[cfg(windows)]
+    return tauri::async_runtime::spawn_blocking(desktop::media::thumb).await.map_err(err)?;
+    #[cfg(not(windows))]
+    Ok(String::new())
+}
+
+#[tauri::command]
+async fn media_control(action: String) -> Result<(), String> {
+    #[cfg(windows)]
+    return tauri::async_runtime::spawn_blocking(move || desktop::media::control(&action))
+        .await
+        .map_err(err)?;
+    #[cfg(not(windows))]
+    {
+        let _ = action;
+        Err("Управление музыкой пока только на Windows".into())
+    }
+}
+
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     app.exit(0);
@@ -194,7 +304,7 @@ pub fn run() {
     }
     #[cfg(mobile)]
     {
-        builder = builder.plugin(tauri_plugin_barcode_scanner::init());
+        builder = builder.plugin(tauri_plugin_barcode_scanner::init()).plugin(tauri_plugin_biometric::init());
     }
 
     builder
@@ -209,7 +319,16 @@ pub fn run() {
             server_start,
             server_reply,
             http_post,
-            discover
+            discover,
+            claude_info,
+            claude_read,
+            claude_write,
+            pet_show,
+            pet_drag,
+            cursor_rel,
+            media_info,
+            media_thumb,
+            media_control
         ])
         .setup(|app| {
             #[cfg(desktop)]
@@ -221,8 +340,9 @@ pub fn run() {
                 // Трей
                 let open = MenuItem::with_id(app, "open", "Открыть Тук", true, None::<&str>)?;
                 let link = MenuItem::with_id(app, "link", "Связь с телефоном", true, None::<&str>)?;
+                let pet = MenuItem::with_id(app, "pet", "Тук на рабочем столе", true, None::<&str>)?;
                 let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
-                let menu = Menu::with_items(app, &[&open, &link, &quit])?;
+                let menu = Menu::with_items(app, &[&open, &link, &pet, &quit])?;
                 let mut tray = TrayIconBuilder::with_id("main")
                     .tooltip("Тук")
                     .menu(&menu)
@@ -234,6 +354,10 @@ pub fn run() {
                         "link" => {
                             show_main(app);
                             let _ = app.emit("open-link", ());
+                        }
+                        "pet" => {
+                            let show = app.get_webview_window("pet").is_none();
+                            let _ = desktop::pet_show(app, show);
                         }
                         "quit" => app.exit(0),
                         _ => {}

@@ -37,6 +37,7 @@ export interface Settings {
   outfit?: import('./character.js').Outfit | 'auto';
   hoodColor?: string;
   lightColor?: string;
+  dance?: boolean; // танцевать под музыку
 }
 
 export interface Data {
@@ -50,6 +51,7 @@ export interface Data {
   settings: Settings;
   chat?: ChatMsg[]; // история разговора (только на этом устройстве)
   recapSeen?: string; // неделя, сводку за которую уже показали
+  agentRules?: import('./agents.js').Rule[]; // «разрешать всегда»
 }
 
 export function emptyData(deviceName: string): Data {

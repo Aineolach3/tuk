@@ -2,7 +2,10 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Права главного окна Тука",
-  "windows": ["main"],
+  "windows": [
+    "main",
+    "pet"
+  ],
   "permissions": [
     "core:default",
     "notification:default"

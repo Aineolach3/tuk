@@ -85,6 +85,11 @@ where
         body.extend_from_slice(&buf[..n]);
     }
     body.truncate(len);
+    // хуки Claude Code принимаем только с этого же компьютера
+    let local = stream.peer_addr().map(|a| a.ip().is_loopback()).unwrap_or(false);
+    if path.starts_with("/hook") && !local {
+        return write_response(&mut stream, 403, "Только с этого компьютера");
+    }
     if method != "POST" && method != "GET" {
         return write_response(&mut stream, 405, "Только POST");
     }
@@ -164,13 +169,19 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::R
 
 /// HTTP POST. Ошибка — строка, понятная человеку (её показывает интерфейс).
 pub fn http_post(host: &str, port: u16, path: &str, body: &str) -> Result<String, String> {
+    http_post_t(host, port, path, body, 4, 200)
+}
+
+/// То же с тайм-аутами: подключение и ожидание ответа (секунды).
+pub fn http_post_t(host: &str, port: u16, path: &str, body: &str, connect_secs: u64, read_secs: u64) -> Result<String, String> {
     let addr: SocketAddr = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("Неверный адрес {host}: {e}"))?
         .next()
         .ok_or_else(|| format!("Неверный адрес {host}"))?;
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(4)).map_err(|e| format!("Нет связи с {host}:{port} ({e})"))?;
-    s.set_read_timeout(Some(Duration::from_secs(200))).ok();
+    let mut s =
+        TcpStream::connect_timeout(&addr, Duration::from_secs(connect_secs)).map_err(|e| format!("Нет связи с {host}:{port} ({e})"))?;
+    s.set_read_timeout(Some(Duration::from_secs(read_secs))).ok();
     s.set_write_timeout(Some(Duration::from_secs(15))).ok();
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -263,6 +274,20 @@ pub fn discover_on(port: u16, ms: u64) -> Result<Vec<String>, String> {
         }
     }
     Ok(out)
+}
+
+/// Кодирование в base64 (стандартный алфавит).
+pub fn b64encode(data: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 /// Декодирование base64 (стандартный алфавит, с «=» или без).
@@ -382,6 +407,10 @@ mod tests {
         assert_eq!(b64decode("SGVsbG8").unwrap(), b"Hello");
         assert_eq!(b64decode("0J/RgNC40LLQtdGC").unwrap(), "Привет".as_bytes());
         assert!(b64decode("@@@").is_none());
+        for v in [&b""[..], b"a", b"ab", b"abc", "Тук".as_bytes()] {
+            assert_eq!(b64decode(&b64encode(v)).unwrap(), v);
+        }
+        assert_eq!(b64encode(b"Hello"), "SGVsbG8=");
     }
 
     #[test]

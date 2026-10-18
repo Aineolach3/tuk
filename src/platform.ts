@@ -186,6 +186,68 @@ export async function saveImage(name: string, base64: string): Promise<string> {
   return invoke('save_image', { name, base64 });
 }
 
+// ---------- Окна, питомец ----------
+
+export function windowLabel(): string {
+  try {
+    return T?.window?.getCurrentWindow?.().label ?? 'main';
+  } catch {
+    return 'main';
+  }
+}
+
+export async function emit(event: string, payload: unknown): Promise<void> {
+  if (T?.event?.emit) await T.event.emit(event, payload).catch(() => {});
+}
+
+export const petShow = (show: boolean) => (kind === 'desktop' ? invoke('pet_show', { show }) : Promise.resolve());
+export const petDrag = () => invoke('pet_drag').catch(() => {});
+export const cursorRel = (): Promise<[number, number] | null> => invoke('cursor_rel').catch(() => null);
+
+// ---------- Музыка (Windows) ----------
+
+export interface Media {
+  title: string;
+  artist: string;
+  app: string;
+  playing: boolean;
+}
+
+export async function mediaInfo(): Promise<Media | null> {
+  if (kind !== 'desktop') return null;
+  const raw: string = await invoke('media_info');
+  return raw && raw !== 'null' ? (JSON.parse(raw) as Media) : null;
+}
+export const mediaThumb = (): Promise<string> => (kind === 'desktop' ? invoke('media_thumb') : Promise.resolve(''));
+export const mediaControl = (action: 'toggle' | 'next' | 'prev') => invoke('media_control', { action });
+
+// ---------- Claude Code ----------
+
+export async function claudeInfo(): Promise<{ exe: string; settings: string; exists: boolean } | null> {
+  if (kind !== 'desktop') return null;
+  return JSON.parse(await invoke('claude_info'));
+}
+export const claudeRead = (): Promise<string> => invoke('claude_read');
+export const claudeWrite = (json: string): Promise<string> => invoke('claude_write', { json });
+
+// ---------- Отпечаток пальца (телефон) ----------
+
+/** true — подтверждено; если биометрии нет на устройстве — тоже true (подтверждение кнопкой). */
+export async function biometric(reason: string): Promise<boolean> {
+  if (kind !== 'android') return true;
+  const b = T?.biometric ?? (globalThis as any).__TAURI_PLUGIN_BIOMETRIC__;
+  try {
+    if (b?.authenticate) {
+      await b.authenticate(reason, { allowDeviceCredential: true, title: 'Тук', subtitle: reason });
+      return true;
+    }
+    await invoke('plugin:biometric|authenticate', { reason, allowDeviceCredential: true });
+    return true;
+  } catch (e) {
+    return /not ?available|no biometric|not enrolled|NoHardware|unavailable/i.test(String((e as Error)?.message ?? e));
+  }
+}
+
 export async function quit(): Promise<void> {
   if (T) await invoke('quit_app');
 }

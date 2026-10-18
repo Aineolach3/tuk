@@ -4,6 +4,8 @@ import { Character, HOOD_COLORS, LIGHT_COLORS, MOOD_LABEL, OUTFIT_LABEL, seasona
 import { play, setVolume, type Sound } from './sounds.js';
 import { MAX_CHARS, readFile, type FileText } from './files.js';
 import { computeRecap, renderRecap } from './recap.js';
+import { AgentHub, KIND_LABEL, hooksInstalled, installHooks, uninstallHooks, type HubEvent, type Pending, type Session } from './agents.js';
+import { runPet, type PetState } from './pet.js';
 import { METRIC_LABEL, healthText, type Item, type Metric } from './model.js';
 import { REPEAT_LABEL, fmtDay, fmtTime, fmtWhen, normalize, parse } from './parser.js';
 import * as P from './platform.js';
@@ -14,7 +16,7 @@ import * as R from './reminders.js';
 import { randomKey } from './crypto.js';
 import { Brain, MODELS, systemPrompt, type BrainState, type ChatMsg, type ModelId } from './brain.js';
 
-type Tab = 'today' | 'chat' | 'tasks' | 'reminders' | 'health' | 'notes' | 'settings';
+type Tab = 'today' | 'chat' | 'tasks' | 'reminders' | 'health' | 'notes' | 'agents' | 'settings';
 
 const $ = <T extends HTMLElement = HTMLElement>(s: string) => document.querySelector(s) as T;
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
@@ -48,6 +50,14 @@ class App {
   pokes: number[] = [];
   file: FileText | null = null; // прикреплённый файл для разговора
   lastBase: Mood = 'idle';
+  hub: AgentHub;
+  remote: { sessions: Session[]; pending: Pending[] } | null = null;
+  claudeHooks: boolean | null = null;
+  media: P.Media | null = null;
+  mediaTitle = '';
+  mediaCover = '';
+  petOpen = false;
+  lastPet = '';
 
   constructor(data: Data) {
     this.store = new Store(data, P.saveData);
@@ -58,6 +68,20 @@ class App {
     this.brain = new Brain(st.model);
     this.brain.onState = (b) => this.onBrainState(b);
     st.volume ??= 0.5;
+    st.dance ??= true;
+    this.hub = new AgentHub(
+      (id, body) => void P.serverReply(id, 200, body),
+      () => this.store.data.agentRules ?? [],
+      (r) => {
+        (this.store.data.agentRules ??= []).push(r);
+        this.store.changed('rules');
+      },
+    );
+    this.hub.onChange = () => this.renderAgents();
+    this.hub.onEvent = (e) => this.onAgentEvent(e);
+    this.link.hookHandler = (id, body) => this.hub.handle(id, body);
+    this.link.agentsHandler = () => this.hub.snapshot();
+    this.link.decideHandler = (reqId, d) => this.hub.decide(reqId, d);
     st.outfit ??= 'auto';
     st.hoodColor ??= 'Чёрный';
     this.char = new Character($<HTMLCanvasElement>('#char'));
@@ -83,8 +107,21 @@ class App {
     // ПК отвечает телефону своим мозгом
     this.link.chatHandler = (messages) => (this.brain.ready ? this.brain.chat(messages, () => {}) : Promise.reject(new Error('Мозг на ПК не загружен')));
     void this.brain.init();
-    if (P.kind === 'desktop') await this.link.startServer();
-    else if (P.kind === 'android') this.link.startClient();
+    if (P.kind === 'desktop') {
+      await this.link.startServer();
+      setInterval(() => void this.pollMedia(), 2000);
+      setInterval(() => this.syncPet(), 300);
+      await P.listen('pet-hello', () => this.syncPet(true));
+      await P.listen('pet-poke', () => this.poke());
+      await P.listen('pet-menu', () => {
+        this.applyMode('expanded');
+        this.setTab('settings');
+      });
+      void this.checkClaude();
+    } else if (P.kind === 'android') {
+      this.link.startClient();
+      setInterval(() => void this.pollAgents(), 3000);
+    }
     await R.syncAndroidSchedule(this.store);
     await P.askNotifyPermission().catch(() => {});
     await P.listen('toggle', () => this.toggleFromShortcut());
@@ -103,7 +140,8 @@ class App {
   baseMood(): Mood {
     const now = Date.now();
     if (R.isAngry(this.store, now)) return 'angry';
-    if (R.ringing(this.store, now).length) return 'alert';
+    if (R.ringing(this.store, now).length || this.agentPending().length) return 'alert';
+    if (this.media?.playing && this.store.data.settings.dance) return 'dance';
     if (now - this.lastActivity > this.store.data.settings.sleepAfterSec * 1000) return 'sleep';
     return 'idle';
   }
@@ -579,6 +617,188 @@ class App {
     }
   }
 
+  // ---------------- Агенты (Claude Code) ----------------
+
+  agentSessions(): Session[] {
+    return P.kind === 'desktop' ? this.hub.active : this.remote?.sessions ?? [];
+  }
+
+  agentPending(): Pending[] {
+    return P.kind === 'desktop' ? this.hub.pending : this.remote?.pending ?? [];
+  }
+
+  onAgentEvent(e: HubEvent): void {
+    const name = this.store.data.settings.name;
+    if (e.type === 'permission') {
+      this.sfx('alert');
+      this.flash('alert', 4000);
+      if (P.kind === 'desktop' && this.mode === 'collapsed') this.applyMode('compact');
+      void P.notify(`${name}: Claude Code просит разрешения`, `${e.p.tool}: ${e.p.summary}`);
+    } else if (e.type === 'done') {
+      this.flash('happy', 2500);
+      this.sfx('done');
+      void P.notify(`${name}: Claude закончил`, `Проект «${e.s.project}»`);
+    } else if (e.type === 'waiting') {
+      void P.notify(`${name}: Claude ждёт вас`, e.message);
+    }
+    this.renderAgents();
+  }
+
+  renderAgents(): void {
+    const has = this.agentSessions().length > 0 || this.agentPending().length > 0 || (P.kind === 'desktop' && !!this.claudeHooks);
+    $('#tab-agents').hidden = !has;
+    this.renderBar();
+    if (this.tab === 'agents') {
+      this.lastHtml = '';
+      this.render();
+    }
+  }
+
+  async decideAgent(reqId: number, d: 'allow' | 'deny' | 'always'): Promise<void> {
+    if (P.kind === 'desktop') {
+      this.hub.decide(reqId, d);
+    } else {
+      if (d !== 'deny' && !(await P.biometric('Разрешить действие Claude Code'))) return;
+      try {
+        await this.link.sendDecision(reqId, d);
+        if (this.remote) this.remote.pending = this.remote.pending.filter((p) => p.reqId !== reqId);
+      } catch (e) {
+        return this.say('ПК не ответил: ' + String((e as Error).message ?? e), 'think', 4000);
+      }
+    }
+    this.sfx(d === 'deny' ? 'poke' : 'done');
+    this.renderAgents();
+  }
+
+  /** Телефон: раз в 3 секунды спрашиваем ПК, что делают агенты. */
+  async pollAgents(): Promise<void> {
+    if (P.kind !== 'android' || !this.link.linked || document.hidden) return;
+    try {
+      const snap = await this.link.askAgents<{ sessions: Session[]; pending: Pending[] }>();
+      const known = new Set((this.remote?.pending ?? []).map((p) => p.reqId));
+      const fresh = snap.pending.filter((p) => !known.has(p.reqId));
+      this.remote = snap;
+      if (fresh.length) {
+        this.sfx('alert');
+        this.flash('alert', 4000);
+        navigator.vibrate?.([120, 80, 120]);
+      }
+      this.renderAgents();
+    } catch {
+      /* ПК недоступен — попробуем позже */
+    }
+  }
+
+  async checkClaude(): Promise<void> {
+    if (P.kind !== 'desktop') return;
+    try {
+      this.claudeHooks = hooksInstalled(await P.claudeRead());
+    } catch {
+      this.claudeHooks = false;
+    }
+    this.renderAgents();
+  }
+
+  async setClaudeHooks(on: boolean): Promise<void> {
+    try {
+      const info = await P.claudeInfo();
+      if (!info) return;
+      const cur = await P.claudeRead();
+      const next = on ? installHooks(cur, info.exe) : uninstallHooks(cur);
+      await P.claudeWrite(next);
+      this.claudeHooks = on;
+      this.say(on ? 'Подключил Claude Code. Перезапустите его — и я начну следить за работой.' : 'Отключил Claude Code. Остальные настройки не тронуты.', on ? 'happy' : 'idle', 6000);
+      this.sfx(on ? 'link' : 'poke');
+    } catch (e) {
+      this.sfx('error');
+      this.say('Не получилось изменить настройки Claude Code: ' + String((e as Error).message ?? e), 'think', 6000);
+    }
+    this.lastHtml = '';
+    this.render();
+    this.renderAgents();
+  }
+
+  agentsHtml(): string {
+    const pend = this.agentPending();
+    const sess = this.agentSessions();
+    const STATUS: Record<Session['status'], string> = { working: 'работает', waiting: 'ждёт вас', done: 'закончил', ended: 'сессия закрыта' };
+    let h = '';
+    if (pend.length) {
+      h += '<h3 class="warn">Просит разрешения</h3><ul>';
+      for (const p of pend)
+        h += `<li class="item perm"><div class="body"><div class="t"><b>${esc(p.tool)}</b> · ${esc(p.summary)}</div><div class="m">${esc(p.project)} · ${ago(p.created)}</div>
+          <div class="row"><button class="pill small" data-act="agent-allow" data-id="${p.reqId}">Разрешить</button><button class="pill ghost small" data-act="agent-always" data-id="${p.reqId}">Всегда в этом проекте</button><button class="pill ghost small" data-act="agent-deny" data-id="${p.reqId}">Запретить</button></div></div></li>`;
+      h += '</ul>';
+    }
+    if (!sess.length && !pend.length)
+      h += `<p class="muted">${P.kind === 'desktop' ? 'Запустите Claude Code — здесь появятся его шаги, правки и запросы разрешений.' : 'Когда на ПК работает Claude Code, здесь видно, что он делает, и можно разрешать его действия.'}</p>`;
+    for (const s of sess) {
+      h += `<h3>${esc(s.project)} <span class="pill-status st-${s.status}">${STATUS[s.status]}</span></h3>`;
+      if (s.prompt) h += `<p class="muted small">«${esc(s.prompt)}»</p>`;
+      const steps = s.steps.slice(-10).reverse();
+      if (steps.length)
+        h += `<ul class="steps">${steps
+          .map((st) => `<li><span class="k k-${st.kind}">${KIND_LABEL[st.kind]}</span> <span class="tx">${esc(st.text)}</span>${st.plus != null ? ` <span class="plus">+${st.plus}</span> <span class="minus">−${st.minus}</span>` : ''}</li>`)
+          .join('')}</ul>`;
+    }
+    return h;
+  }
+
+  // ---------------- Музыка ----------------
+
+  async pollMedia(): Promise<void> {
+    try {
+      const m = await P.mediaInfo();
+      const changed = JSON.stringify(m) !== JSON.stringify(this.media);
+      this.media = m;
+      if (m && m.title !== this.mediaTitle) {
+        this.mediaTitle = m.title;
+        const b64 = await P.mediaThumb().catch(() => '');
+        this.mediaCover = b64 ? `data:image/jpeg;base64,${b64}` : '';
+      }
+      if (changed) {
+        this.renderBar();
+        if (this.tab === 'today') this.render();
+      }
+    } catch {
+      this.media = null;
+    }
+  }
+
+  musicHtml(): string {
+    const m = this.media;
+    if (!m) return '';
+    return `<div class="card music">${this.mediaCover ? `<img src="${this.mediaCover}" alt="">` : '<div class="cover">♪</div>'}
+      <div class="body"><div class="t">${esc(m.title || 'Без названия')}</div><div class="m">${esc(m.artist)}</div></div>
+      <div class="ctl"><button class="mini" data-act="media-prev" aria-label="Назад">⏮</button><button class="mini ok" data-act="media-toggle" aria-label="Пауза">${m.playing ? '⏸' : '▶'}</button><button class="mini" data-act="media-next" aria-label="Дальше">⏭</button></div></div>`;
+  }
+
+  // ---------------- Питомец ----------------
+
+  /** Отправить состояние персонажа окну питомца, если оно изменилось. */
+  syncPet(force = false): void {
+    if (P.kind !== 'desktop') return;
+    const st: PetState = { mood: this.char.mood, outfit: this.char.outfit, hood: this.char.hood, light: this.char.idleLight };
+    const key = JSON.stringify(st);
+    if (!force && key === this.lastPet) return;
+    this.lastPet = key;
+    void P.emit('pet-state', st);
+  }
+
+  async togglePet(show: boolean): Promise<void> {
+    try {
+      await P.petShow(show);
+      this.petOpen = show;
+      this.sfx(show ? 'hello' : 'poke');
+      this.say(show ? 'Я на рабочем столе! Перетаскивайте меня, двойной клик — верну в строку.' : 'Вернулся в строку.', show ? 'wave' : 'idle', 3500);
+      setTimeout(() => this.syncPet(true), 600);
+    } catch (e) {
+      this.say('Не получилось: ' + String((e as Error).message ?? e), 'think', 4000);
+    }
+    this.lastHtml = '';
+    this.render();
+  }
+
   // ---------------- События ----------------
 
   bind(): void {
@@ -675,6 +895,7 @@ class App {
         void P.setAutostart(t.checked);
       } else if (t.id === 'set-name') st.name = t.value.trim() || 'Тук';
       else if (t.id === 'set-usepc') st.usePcBrain = t.checked;
+      else if (t.id === 'set-dance') st.dance = t.checked;
       else if (t.id === 'set-volume') {
         st.volume = +t.value / 100;
         this.applyLook();
@@ -806,6 +1027,29 @@ class App {
           await this.brain.switchModel(id as ModelId);
         }
         break;
+      case 'agent-allow':
+      case 'agent-deny':
+      case 'agent-always':
+        await this.decideAgent(+id, act === 'agent-allow' ? 'allow' : act === 'agent-deny' ? 'deny' : 'always');
+        break;
+      case 'media-toggle':
+      case 'media-next':
+      case 'media-prev':
+        await P.mediaControl(act === 'media-toggle' ? 'toggle' : act === 'media-next' ? 'next' : 'prev').catch(() => {});
+        setTimeout(() => void this.pollMedia(), 400);
+        break;
+      case 'pet-on':
+        await this.togglePet(true);
+        break;
+      case 'pet-off':
+        await this.togglePet(false);
+        break;
+      case 'claude-on':
+        await this.setClaudeHooks(true);
+        break;
+      case 'claude-off':
+        await this.setClaudeHooks(false);
+        break;
       case 'file-drop':
         this.file = null;
         this.renderFileChip();
@@ -936,12 +1180,20 @@ class App {
     const badge = $('#bar-badge');
     let line = '';
     let actions = '';
-    if (ring.length) {
+    const pend = this.agentPending();
+    if (pend.length) {
+      const p = pend[0];
+      line = `<b>Claude: ${esc(p.tool)}</b> ${esc(p.summary)}`;
+      actions = `<button class="mini ok" data-act="agent-allow" data-id="${p.reqId}" title="Разрешить">✓</button><button class="mini" data-act="agent-deny" data-id="${p.reqId}" title="Запретить">✕</button>`;
+    } else if (ring.length) {
       const it = ring[0];
       line = `<b>${esc(it.text)}</b>`;
       actions = `<button class="mini ok" data-act="done" data-id="${it.id}" title="Готово">✓</button><button class="mini" data-act="snooze" data-id="${it.id}" data-min="10" title="Отложить на 10 минут">+10</button>`;
     } else if (this.reply && this.mode !== 'expanded') {
       line = esc(this.reply);
+    } else if (this.media?.playing) {
+      line = `<span class="muted">♪</span> ${esc(this.media.title)}${this.media.artist ? ` <span class="muted">— ${esc(this.media.artist)}</span>` : ''}`;
+      actions = `<button class="mini" data-act="media-toggle" title="Пауза">⏸</button><button class="mini" data-act="media-next" title="Дальше">⏭</button>`;
     } else {
       const next = R.activeReminders(this.store)
         .filter((i) => (i.dueAt ?? 0) > now)
@@ -951,12 +1203,12 @@ class App {
     }
     if (this.mode === 'collapsed' && P.kind === 'desktop') {
       const next = R.activeReminders(this.store).filter((i) => (i.dueAt ?? 0) > now).sort((a, b) => a.dueAt! - b.dueAt!)[0];
-      line = ring.length ? '<b>!</b>' : next && next.dueAt! - now < 12 * 3_600_000 ? `<span class="muted">${fmtTime(next.dueAt!)}</span>` : '';
+      line = ring.length || pend.length ? '<b>!</b>' : this.media?.playing ? '<span class="muted">♪</span>' : next && next.dueAt! - now < 12 * 3_600_000 ? `<span class="muted">${fmtTime(next.dueAt!)}</span>` : '';
       actions = '';
     }
     text.innerHTML = line;
     act.innerHTML = actions;
-    const n = ring.length;
+    const n = ring.length + pend.length;
     badge.textContent = n ? String(n) : '';
     badge.classList.toggle('show', n > 0);
   }
@@ -967,6 +1219,8 @@ class App {
         return this.todayHtml();
       case 'chat':
         return this.chatHtml();
+      case 'agents':
+        return this.agentsHtml();
       case 'tasks':
         return this.tasksHtml();
       case 'reminders':
@@ -1011,7 +1265,7 @@ class App {
     const tasksToday = s.items.filter((i) => i.kind === 'task' && !i.done && i.dueAt != null && i.dueAt < end);
     const noDue = s.items.filter((i) => i.kind === 'task' && !i.done && i.dueAt == null).sort((a, b) => b.createdAt - a.createdAt).slice(0, 6);
     const doneToday = s.items.filter((i) => i.done && (i.doneAt ?? 0) >= startOfDay()).length;
-    let h = `<div class="hello"><div class="big">${fmtDay(now).replace(/^./, (c) => c.toUpperCase())}, ${new Date(now).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' })}</div><div class="muted">${this.summary()}${doneToday ? ` Сделано сегодня: ${doneToday}.` : ''}</div></div>`;
+    let h = this.musicHtml() + `<div class="hello"><div class="big">${fmtDay(now).replace(/^./, (c) => c.toUpperCase())}, ${new Date(now).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' })}</div><div class="muted">${this.summary()}${doneToday ? ` Сделано сегодня: ${doneToday}.` : ''}</div></div>`;
     h += this.section('Просрочено', ring, '', 'warn');
     h += this.section('Сегодня', [...todayRem, ...tasksToday], 'На сегодня ничего не запланировано');
     h += this.section('Без срока', noDue);
@@ -1136,6 +1390,16 @@ class App {
       <div class="swatches">${Object.entries(HOOD_COLORS).map(([n, c]) => `<button class="sw ${st.hoodColor === n ? 'on' : ''}" data-act="set-hood" data-id="${esc(n)}" title="${esc(n)}" style="background:rgb(${c.join(',')})"></button>`).join('')}</div>
       <p class="muted small">Огонёк в покое</p>
       <div class="swatches"><button class="sw auto ${!st.lightColor ? 'on' : ''}" data-act="set-light" data-id="" title="Как задумано">✦</button>${Object.entries(LIGHT_COLORS).map(([n, c]) => `<button class="sw ${st.lightColor === n ? 'on' : ''}" data-act="set-light" data-id="${esc(n)}" title="${esc(n)}" style="background:rgb(${c.join(',')})"></button>`).join('')}</div>
+      ${P.kind === 'desktop' ? `<h3>На рабочем столе</h3>
+      <div class="row"><button class="pill ${this.petOpen ? 'ghost' : ''}" data-act="${this.petOpen ? 'pet-off' : 'pet-on'}">${this.petOpen ? 'Вернуть Тука в строку' : 'Выпустить Тука на рабочий стол'}</button></div>
+      <p class="muted small">Его можно перетаскивать; клик — тычок, двойной клик — обратно в строку. То же — в меню значка в трее.</p>
+      <h3>Музыка</h3>
+      <label class="toggle"><input type="checkbox" id="set-dance" ${st.dance ? 'checked' : ''}> Танцевать под музыку</label>
+      <p class="muted small">Тук видит, что играет в Spotify, Яндекс Музыке, браузере и других плеерах Windows, и управляет ими из строки.</p>
+      <h3>Claude Code</h3>
+      <div class="card">${this.claudeHooks ? '<b>Подключён.</b> <span class="muted">Шаги и запросы разрешений — во вкладке «Агенты», на ПК и на телефоне.</span>' : '<span class="muted">Тук будет показывать, что делает Claude Code, и просить разрешения прямо в строке — на ПК и на телефоне.</span>'}
+      <div class="row">${this.claudeHooks ? '<button class="pill ghost small" data-act="claude-off">Отключить</button>' : '<button class="pill small" data-act="claude-on">Подключить Claude Code</button>'}</div>
+      <p class="muted small">Тук добавит свои хуки в ~/.claude/settings.json и сохранит копию файла. Ваши настройки не меняются.</p></div>` : ''}
       <h3>Сводка</h3>
       <button class="pill ghost" data-act="recap">Сводка за неделю</button>
       ${P.kind === 'desktop' ? `<label class="toggle"><input type="checkbox" id="set-autostart" ${st.autostart ? 'checked' : ''}> Запускать вместе с Windows</label><p class="muted">Открыть строку: Ctrl+Alt+Пробел. Свернуть: Esc.</p>` : ''}
@@ -1146,6 +1410,7 @@ class App {
 }
 
 async function main() {
+  if (P.windowLabel() === 'pet') return runPet();
   let data: Data | null = null;
   try {
     const raw = await P.loadData();

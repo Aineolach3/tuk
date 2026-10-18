@@ -21,6 +21,11 @@ export class Link {
   onRemoteChange: (n: number) => void = () => {};
   /** ПК: ответить телефону своим мозгом (null — мозг не готов). */
   chatHandler: ((messages: ChatMsg[]) => Promise<string>) | null = null;
+  /** ПК: события хуков Claude Code (только с этого компьютера — проверяет Rust). */
+  hookHandler: ((reqId: number, body: string) => void) | null = null;
+  /** ПК: состояние агентов для телефона и решение по разрешению. */
+  agentsHandler: (() => unknown) | null = null;
+  decideHandler: ((reqId: number, d: 'allow' | 'deny' | 'always') => boolean) | null = null;
 
   constructor(private store: Store) {}
 
@@ -67,6 +72,19 @@ export class Link {
         this.store.changed('sync');
         this.refreshServerStatus();
         return P.serverReply(req.id, 200, await seal(d.sync.key!, d.deviceId, resp));
+      }
+      if (req.path === '/hook') {
+        if (!this.hookHandler) return P.serverReply(req.id, 200, '');
+        return this.hookHandler(req.id, req.body); // ответит сам, когда будет решение
+      }
+      if (req.path === '/agents') {
+        await open(d.sync.key!, req.body);
+        return P.serverReply(req.id, 200, await seal(d.sync.key!, d.deviceId, this.agentsHandler?.() ?? { sessions: [], pending: [] }));
+      }
+      if (req.path === '/agent-decide') {
+        const { payload } = await open<{ reqId: number; d: 'allow' | 'deny' | 'always' }>(d.sync.key!, req.body);
+        const ok = this.decideHandler?.(payload.reqId, payload.d) ?? false;
+        return P.serverReply(req.id, 200, await seal(d.sync.key!, d.deviceId, { ok }));
       }
       if (req.path === '/chat') {
         const { payload } = await open<{ messages: ChatMsg[] }>(d.sync.key!, req.body);
@@ -178,6 +196,19 @@ export class Link {
     const body = await P.httpPost(s.host!, s.port ?? SYNC_PORT, '/chat', await seal(s.key!, d.deviceId, { messages }));
     const { payload } = await open<{ text: string }>(s.key!, body);
     return payload.text;
+  }
+
+  /** Телефон: что делают агенты на ПК. */
+  async askAgents<T>(): Promise<T> {
+    const d = this.store.data, s = d.sync;
+    const body = await P.httpPost(s.host!, s.port ?? SYNC_PORT, '/agents', await seal(s.key!, d.deviceId, {}));
+    return (await open<T>(s.key!, body)).payload;
+  }
+
+  async sendDecision(reqId: number, dec: 'allow' | 'deny' | 'always'): Promise<boolean> {
+    const d = this.store.data, s = d.sync;
+    const body = await P.httpPost(s.host!, s.port ?? SYNC_PORT, '/agent-decide', await seal(s.key!, d.deviceId, { reqId, d: dec }));
+    return (await open<{ ok: boolean }>(s.key!, body)).payload.ok;
   }
 
   async pairByCode(code: string): Promise<void> {
