@@ -177,7 +177,13 @@ fn pet_show(app: AppHandle, show: bool) -> Result<(), String> {
 
 #[tauri::command]
 fn pet_drag(window: tauri::WebviewWindow) -> Result<(), String> {
-    window.start_dragging().map_err(err)
+    #[cfg(desktop)]
+    return window.start_dragging().map_err(err);
+    #[cfg(mobile)]
+    {
+        let _ = window;
+        Ok(())
+    }
 }
 
 #[tauri::command]
