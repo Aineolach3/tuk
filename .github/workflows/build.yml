@@ -6,6 +6,11 @@ on:
   push:
   workflow_dispatch:
 
+# новая загрузка отменяет недоделанную старую сборку
+concurrency:
+  group: build
+  cancel-in-progress: true
+
 jobs:
   android:
     name: APK для Android
@@ -86,3 +91,28 @@ jobs:
           name: Tuk-Windows-setup
           path: src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
+
+  # Выкладывает готовые файлы в Releases — их видно в приложении GitHub и на сайте
+  release:
+    name: Публикация в Releases
+    needs: [android, windows]
+    if: always() && (needs.android.result == 'success' || needs.windows.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Создать релиз
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la out
+          for f in out/*.apk; do [ -e "$f" ] && mv "$f" out/Tuk-android.apk; done
+          TAG="build-${{ github.run_number }}"
+          NOTES="Сборка №${{ github.run_number }}. Android: ${{ needs.android.result }}, Windows: ${{ needs.windows.result }}.
+          На телефоне скачайте Tuk-android.apk, на ПК — файл *setup.exe."
+          gh release create "$TAG" out/* --repo "${{ github.repository }}" --title "Тук, сборка ${{ github.run_number }}" --notes "$NOTES" --latest
