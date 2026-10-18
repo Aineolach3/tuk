@@ -17,10 +17,13 @@ import { randomKey } from './crypto.js';
 
 /** Кадры острова: настроение, число кадров, кадров в секунду. */
 const ISLAND_MOODS: [Mood, number, number][] = [
-  ['idle', 32, 10], ['sleep', 24, 6], ['think', 16, 10], ['write', 16, 10], ['happy', 20, 14], ['angry', 16, 14],
-  ['alert', 16, 14], ['listen', 20, 10], ['dance', 24, 12], ['wave', 20, 12], ['poke', 12, 12],
+  ['idle', 24, 8], ['near', 20, 8], ['sleep', 20, 6], ['think', 20, 10], ['work', 16, 12], ['write', 16, 10],
+  ['search', 24, 10], ['ready', 20, 8], ['help', 24, 8], ['carry', 16, 12], ['listen', 20, 10], ['happy', 20, 14],
+  ['angry', 16, 14], ['alert', 16, 14], ['dance', 24, 12], ['wave', 20, 12], ['poke', 12, 12], ['away', 18, 12],
 ];
-const ISLAND_SPRITE_VERSION = ':2';
+/** Кадр острова: Тук в полный рост с предметами (ширина × высота, px). */
+const ISLAND_FRAME: [number, number] = [170, 136];
+const ISLAND_SPRITE_VERSION = ':3';
 import { Brain, MODELS, systemPrompt, type BrainState, type ChatMsg, type ModelId } from './brain.js';
 
 type Tab = 'today' | 'chat' | 'tasks' | 'reminders' | 'health' | 'notes' | 'agents' | 'settings';
@@ -68,6 +71,8 @@ class App {
   islandKey = '';
   spritesBusy = false;
   awaitGrant = false;
+  islandState: { granted?: boolean; running?: boolean; mic?: boolean; model?: string; progress?: number; error?: string } | null = null;
+  modelTimer: ReturnType<typeof setInterval> | null = null;
   drop = false;
   voice: 'off' | 'listening' | 'speaking' = 'off';
   voiceAsked = false;
@@ -140,6 +145,8 @@ class App {
       document.addEventListener('visibilitychange', async () => {
         if (document.hidden) {
           if (this.voice === 'listening') void P.listenStop(true);
+          this.flash('away', 1600); // «свернулся, но остался рядом» — это видно на острове
+          this.pushIsland();
           if (this.drop) {
             this.drop = false;
             document.documentElement.classList.remove('drop');
@@ -151,6 +158,7 @@ class App {
           this.awaitGrant = false;
           const c = await P.island('check').catch(() => null);
           if (c?.granted) {
+            if (this.store.data.settings.wake) return void this.toggleWake(true);
             await this.startIsland();
             this.say('Готово — я наверху экрана. Нажмите на меня в любом приложении.', 'wave', 5000);
           } else this.say('Без разрешения «Поверх других приложений» я не смогу быть наверху экрана.', 'think', 5000);
@@ -179,9 +187,27 @@ class App {
     const now = Date.now();
     if (R.isAngry(this.store, now)) return 'angry';
     if (R.ringing(this.store, now).length || this.agentPending().length) return 'alert';
+    const agent = this.agentMood(now);
+    if (agent) return agent;
+    if (this.voice === 'speaking') return 'ready';
     if (this.media?.playing && this.store.data.settings.dance) return 'dance';
-    if (now - this.lastActivity > this.store.data.settings.sleepAfterSec * 1000) return 'sleep';
+    const quiet = now - this.lastActivity;
+    if (quiet > this.store.data.settings.sleepAfterSec * 1000) return 'sleep';
+    if (this.reply && now < this.replyUntil) return 'ready'; // ответил — ждёт следующую задачу
+    if (quiet > 45_000) return 'near';
     return 'idle';
+  }
+
+  /** Что делает агент (Claude Code) — то и показывает Тук: ищет, работает, выполняет, думает. */
+  agentMood(now: number): Mood | null {
+    for (const s of this.agentSessions()) {
+      if (s.status !== 'working') continue;
+      const st = s.steps[s.steps.length - 1];
+      if (!st || now - st.t > 20_000) return 'think';
+      const MAP: Record<string, Mood> = { read: 'search', search: 'search', web: 'search', edit: 'work', run: 'carry', task: 'help', other: 'work' };
+      return MAP[st.kind] ?? 'work';
+    }
+    return null;
   }
 
   flash(m: Mood, ms: number): void {
@@ -247,6 +273,7 @@ class App {
   hovering = false;
 
   applyMode(m: P.BarMode): void {
+    if (P.kind === 'desktop' && m === 'collapsed' && this.mode === 'expanded' && !this.tempMood) this.flash('away', 1300);
     this.mode = m;
     const root = document.documentElement;
     root.classList.remove('mode-collapsed', 'mode-compact', 'mode-expanded');
@@ -283,8 +310,8 @@ class App {
         return this.say('Чтобы разговаривать, мне нужен мозг — его можно скачать во вкладке «Чат». А задачи записываю и так: «запиши …».', 'think', 6000);
       }
     }
-    this.flash('think', 500);
-    await new Promise((r) => setTimeout(r, 450));
+    this.flash(p.type === 'done' || p.type === 'delete' || p.type === 'query' ? 'search' : 'think', 700);
+    await new Promise((r) => setTimeout(r, 650));
     const s = this.store;
 
     switch (p.type) {
@@ -324,18 +351,18 @@ class App {
         const it = this.find(p.query, true);
         if (!it) return this.say(`Не нашёл «${p.query}».`, 'think', 2500);
         s.remove(it.id);
-        this.say(`Удалил: «${it.text}».`, 'write', 1200);
+        this.say(`Удалил: «${it.text}».`, 'carry', 1500);
         break;
       }
       case 'query':
         this.setTab(p.what);
-        this.say(this.summary(), 'idle', 4000);
+        this.say(this.summary(), 'help', 4000);
         break;
       case 'greet':
         this.say(`Привет! ${this.summary()}`, 'happy', 3000);
         break;
       case 'help':
-        this.say('Например: «напомни завтра в 9 позвонить», «запиши купить кабель», «давление 125 на 80», «готово кабель».', 'idle', 9000);
+        this.say('Например: «напомни завтра в 9 позвонить», «запиши купить кабель», «давление 125 на 80», «готово кабель».', 'help', 9000);
         break;
     }
   }
@@ -383,9 +410,10 @@ class App {
     this.generating = true;
     this.streamText = '';
     this.chatAbort = new AbortController();
-    this.tempMood = 'think';
+    const look: Mood = this.file ? 'search' : 'think'; // с файлом — «ищет» в нём
+    this.tempMood = look;
     this.tempUntil = Date.now() + 600_000;
-    this.char.set('think');
+    this.char.set(look);
     this.renderChatLive();
     let answer = '';
     try {
@@ -401,7 +429,7 @@ class App {
         answer = await this.brain.chat(
           messages,
           (full) => {
-            if (!this.streamText) this.flash('listen', 600_000);
+            if (!this.streamText) this.flash('work', 600_000);
             this.streamText = full;
             this.renderChatLive();
           },
@@ -423,7 +451,7 @@ class App {
       this.generating = false;
       this.streamText = '';
       this.chatAbort = null;
-      if (this.tempMood === 'think' || this.tempMood === 'listen') this.tempMood = null;
+      if (['think', 'listen', 'work', 'search'].includes(this.tempMood as string)) this.tempMood = null;
       this.lastHtml = '';
       this.render();
     }
@@ -606,6 +634,7 @@ class App {
     this.flash('eat', 1400);
     this.sfx('eat');
     try {
+      setTimeout(() => this.tempMood === 'eat' && this.flash('search', 2500), 1300);
       this.file = await readFile(f);
       const pages = this.file.pages ? ` (${this.file.pages} стр.)` : '';
       const cut = this.file.truncated ? ` Прочитал первые ${MAX_CHARS} символов — больше в мою голову не влезет.` : '';
@@ -631,6 +660,7 @@ class App {
   // ---------------- Недельная сводка ----------------
 
   showRecap(): void {
+    this.flash('help', 3500);
     const st = this.store.data.settings;
     const chatTimes = (this.store.data.chat ?? []).filter((m) => m.role === 'user' && m.ts).map((m) => m.ts!);
     const r = computeRecap(Object.values(this.store.data.items), chatTimes);
@@ -848,12 +878,16 @@ class App {
 
   /** Включить остров при запуске, если он был включён. */
   async startIsland(): Promise<void> {
-    if (P.kind !== 'android' || !this.store.data.settings.island) return;
+    if (P.kind !== 'android') return;
+    const set = this.store.data.settings;
     try {
       const st = await P.island('check');
+      this.islandState = st;
+      if (!set.island && !set.wake) return;
       if (!st?.granted) return;
-      if (!st.running) await P.island('start');
-      this.islandOn = true;
+      const wake = !!set.wake && st.model === 'ready' && st.mic;
+      await P.island('config', { show: !!set.island, wake });
+      this.islandOn = !!set.island;
       this.islandKey = '';
       await this.sendSprites();
       this.pushIsland();
@@ -862,12 +896,90 @@ class App {
     }
   }
 
+  /** «Тук Тук»: скачать распознавание (один раз) и включить прослушивание. */
+  async toggleWake(on: boolean): Promise<void> {
+    const set = this.store.data.settings;
+    if (!on) {
+      set.wake = false;
+      this.store.changed('settings');
+      await this.startIsland();
+      if (!set.island) await P.island('config', { show: false, wake: false }).catch(() => {});
+      this.say('Больше не слушаю «Тук Тук».', 'idle', 3000);
+      this.lastHtml = '';
+      return this.render();
+    }
+    const st = await P.island('check').catch(() => null);
+    this.islandState = st;
+    if (!st?.granted) {
+      this.awaitGrant = true;
+      set.wake = true;
+      this.store.changed('settings');
+      this.say('Разрешите Туку «Поверх других приложений» — тогда он сможет откликаться на «Тук Тук» из любого места.', 'think', 8000);
+      return void P.island('grant').catch(() => {});
+    }
+    if (st.model !== 'ready') {
+      set.wake = true;
+      this.store.changed('settings');
+      await P.island('download');
+      this.say('Скачиваю распознавание речи (45 МБ) — это один раз, дальше всё работает без интернета.', 'carry', 6000);
+      this.watchModel();
+      return;
+    }
+    set.wake = true;
+    this.store.changed('settings');
+    try {
+      await P.island('config', { show: !!set.island, wake: true });
+      this.say('Слушаю! Скажите «Тук Тук» — и команду. Можно сразу: «Тук Тук, напомни через час позвонить».', 'listen', 6000);
+    } catch (e) {
+      set.wake = false;
+      this.say(String((e as Error).message ?? e), 'think', 6000);
+    }
+    await this.startIsland();
+    this.lastHtml = '';
+    this.render();
+  }
+
+  /** Следить за скачиванием модели и включить «Тук Тук», когда готово. */
+  watchModel(): void {
+    if (this.modelTimer) return;
+    this.modelTimer = setInterval(async () => {
+      const st = await P.island('check').catch(() => null);
+      this.islandState = st;
+      if (this.tab === 'settings') {
+        this.lastHtml = '';
+        this.render();
+      }
+      if (st?.model === 'ready' || st?.model === 'error') {
+        clearInterval(this.modelTimer!);
+        this.modelTimer = null;
+        if (st.model === 'ready') await this.toggleWake(true);
+        else this.say('Не получилось скачать распознавание: ' + (st.error ?? 'нет интернета?'), 'think', 6000);
+      }
+    }, 1000);
+  }
+
+  wakeHtml(): string {
+    const st = this.islandState;
+    const set = this.store.data.settings;
+    let h = '<h3>«Тук Тук» — голосом</h3><div class="card">';
+    if (st?.model === 'downloading') {
+      h += `<b>Скачиваю распознавание…</b><div class="progress"><i style="width:${st.progress ?? 0}%"></i></div><span class="muted small">${st.progress ?? 0}% · один раз, ~45 МБ</span>`;
+    } else if (set.wake && st?.model === 'ready') {
+      h += '<b>Слушаю «Тук Тук».</b> <span class="muted">Скажите «Тук Тук» — Тук пискнет и выслушает команду. Работает на любом экране, без интернета.</span><div class="row"><button class="pill ghost small" data-act="wake-off">Не слушать</button></div>';
+    } else {
+      h += '<span class="muted">Тук всегда слушает, но откликается только на «Тук Тук», а потом выполняет команду или отвечает голосом. Распознавание работает прямо на телефоне и без интернета. Один раз нужно скачать языковую модель — около 45 МБ.</span><div class="row"><button class="pill small" data-act="wake-on">' + (st?.model === 'ready' ? 'Включить' : 'Скачать и включить') + '</button></div>';
+    }
+    h += '<p class="muted small">Пока Тук слушает, вверху горит значок микрофона — так Android показывает, что микрофон включён. Звук никуда не отправляется.</p></div>';
+    return h;
+  }
+
   async toggleIsland(on: boolean): Promise<void> {
     const st = this.store.data.settings;
     st.island = on;
     this.store.changed('settings');
     if (!on) {
-      await P.island('stop').catch(() => {});
+      if (st.wake) await P.island('config', { show: false, wake: true }).catch(() => {});
+      else await P.island('config', { show: false, wake: false }).catch(() => {});
       this.islandOn = false;
       this.say('Убрал Тука с верхней части экрана.', 'idle', 3000);
     } else {
@@ -893,7 +1005,7 @@ class App {
     this.spritesBusy = true;
     try {
       for (const [mood, frames, fps] of ISLAND_MOODS) {
-        const data = Character.sheet(look, mood, frames, fps, 96);
+        const data = Character.sheet(look, mood, frames, fps, ISLAND_FRAME[0], ISLAND_FRAME[1]);
         await P.island('sprite', { mood, data, frames, fps });
         await new Promise((r) => setTimeout(r, 30));
       }
@@ -934,6 +1046,13 @@ class App {
     if (P.kind !== 'android') return;
     const r = await P.island('consume').catch(() => null);
     if (r?.drop) this.enterDrop();
+    if (r?.cmd) {
+      // команда после «Тук Тук» — выполнить и ответить голосом
+      this.voiceAsked = true;
+      $<HTMLInputElement>('#input').value = '';
+      await this.handleInput(String(r.cmd));
+      setTimeout(() => (this.voiceAsked = false), 1500);
+    }
   }
 
   enterDrop(): void {
@@ -1244,6 +1363,7 @@ class App {
         break;
       }
       case 'sync':
+        this.flash('carry', 1800);
         await this.link.syncNow();
         break;
       case 'unlink':
@@ -1285,6 +1405,10 @@ class App {
         return this.toggleIsland(true);
       case 'island-off':
         return this.toggleIsland(false);
+      case 'wake-on':
+        return this.toggleWake(true);
+      case 'wake-off':
+        return this.toggleWake(false);
       case 'drop-close':
         return this.exitDrop(true);
       case 'drop-full':
@@ -1655,6 +1779,7 @@ class App {
       <div class="card">${st.island && this.islandOn ? '<b>Включён.</b> <span class="muted">Тук живёт вверху экрана, вокруг камеры. Нажатие — выпадающее окно, долгое нажатие — всё приложение.</span>' : '<span class="muted">Маленький анимированный Тук вверху экрана поверх любых приложений. Нажали — открылось небольшое окно: голос, записи, дела на сегодня.</span>'}
       <div class="row">${st.island && this.islandOn ? '<button class="pill ghost small" data-act="island-off">Убрать</button>' : '<button class="pill small" data-act="island-on">Включить</button>'}</div>
       <p class="muted small">Нужно разрешение «Поверх других приложений». В шторке появится тихое уведомление «Тук рядом» — так Android не выгружает Тука.</p></div>
+      ${this.wakeHtml()}
       <h3>Голос</h3>
       <label class="toggle"><input type="checkbox" id="set-voiceloop" ${st.voiceLoop !== false ? 'checked' : ''}> Продолжать разговор после ответа</label>
       <p class="muted small">Нажмите 🎤 и говорите. Без интернета распознавание работает, если скачан русский язык: Настройки → Общие настройки → Язык и ввод → Распознавание речи (или Google → Офлайн-распознавание). Голос Тука — системный синтез речи.</p>` : ''}

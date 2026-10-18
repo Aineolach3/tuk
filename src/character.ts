@@ -2,10 +2,12 @@
 // тактическая куртка с нашивкой «Т» и рюкзак. Рта нет — настроение показывают глаза
 // и огонёк на кончике антенны. Рисуется в Canvas 2D, одинаково на Windows и Android.
 
-export type Mood = 'sleep' | 'idle' | 'listen' | 'think' | 'write' | 'happy' | 'angry' | 'alert' | 'meet' | 'wave' | 'poke' | 'dizzy' | 'dance' | 'eat';
+export type Mood =
+  | 'sleep' | 'idle' | 'listen' | 'think' | 'write' | 'happy' | 'angry' | 'alert' | 'meet' | 'wave' | 'poke' | 'dizzy' | 'dance' | 'eat'
+  | 'work' | 'search' | 'ready' | 'help' | 'carry' | 'near' | 'away';
 
 export const MOOD_LABEL: Record<Mood, string> = {
-  sleep: 'Спит',
+  sleep: 'Отдыхает',
   idle: 'Бодрствует',
   listen: 'Слушает',
   think: 'Думает',
@@ -19,6 +21,13 @@ export const MOOD_LABEL: Record<Mood, string> = {
   dizzy: 'Голова кружится',
   dance: 'Танцует',
   eat: 'Глотает файл',
+  work: 'Работает',
+  search: 'Ищет',
+  ready: 'Готов',
+  help: 'Помогает',
+  carry: 'Выполняет',
+  near: 'Рядом',
+  away: 'Уходит в фон',
 };
 
 /** Цвет огонька антенны для каждого настроения. */
@@ -37,6 +46,13 @@ const LIGHT: Record<Mood, [number, number, number]> = {
   dizzy: [200, 140, 255],
   dance: [255, 90, 200],
   eat: [140, 220, 255],
+  work: [255, 214, 150],
+  search: [140, 220, 255],
+  ready: [255, 240, 210],
+  help: [120, 255, 190],
+  carry: [255, 190, 90],
+  near: [255, 228, 186],
+  away: [160, 185, 255],
 };
 
 // ---------- Гардероб и цвета ----------
@@ -89,6 +105,7 @@ const INK = '#07070a';
 const rgb = (c: number[], a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
 const mix = (a: number[], b: number[], t: number) => a.map((v, i) => v + (b[i] - v) * t);
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+const frac = (v: number) => ((v % 1) + 1) % 1;
 
 interface Particle {
   kind: 'z' | 'heart' | 'spark' | 'note' | 'doc';
@@ -148,29 +165,27 @@ export class Character {
    * Лист кадров (по горизонтали) для «острова» на Android — PNG в base64 без префикса.
    * Рисуется тем же кодом, поэтому наряд и цвета совпадают с приложением.
    */
-  static sheet(look: { outfit: Outfit; hood: number[]; light: number[] | null }, mood: Mood, frames: number, fps: number, size: number, peek = 0, zoom = 1.7): string {
-    // рисуем крупнее и берём верхнюю часть: на острове видны голова и антенна
-    const big = Math.round(size * zoom);
+  static sheet(look: { outfit: Outfit; hood: number[]; light: number[] | null }, mood: Mood, frames: number, fps: number, w: number, h: number): string {
     const one = document.createElement('canvas');
-    one.width = one.height = big;
+    one.width = w;
+    one.height = h;
     const ch = new Character(one, { still: true, fixed: true });
     ch.outfit = look.outfit;
     ch.hood = look.hood;
     ch.idleLight = look.light;
-    ch.peek = peek;
     ch.mood = mood;
-    ch.since = -4000;
+    ch.since = mood === 'away' ? 0 : -4000;
     // разогрев: частицы (Zzz, ноты, сердечки) успевают появиться
-    for (let t = -3000; t < 0; t += 1000 / fps) ch.draw(t);
+    if (mood !== 'away') for (let t = -3000; t < 0; t += 1000 / fps) ch.draw(t);
     const out = document.createElement('canvas');
-    out.width = size * frames;
-    out.height = size;
+    out.width = w * frames;
+    out.height = h;
     const o = out.getContext('2d')!;
     for (let i = 0; i < frames; i++) {
       const now = (i * 1000) / fps;
       if (mood !== 'sleep' && i === 3) ch.blinkUntil = now + 130;
       ch.draw(now);
-      o.drawImage(one, (big - size) / 2, big * 0.04, size, size, i * size, 0, size, size);
+      o.drawImage(one, i * w, 0);
     }
     return out.toDataURL('image/png').split(',')[1];
   }
@@ -240,12 +255,12 @@ export class Character {
     let sx = 1, sy = 1, rot = 0;
 
     if (m === 'idle') cy += Math.sin(t * 2) * u * 0.025;
-    if (m === 'sleep') { sy = 1 + Math.sin(t * 1.4) * 0.025; rot = 0.08; cy += u * 0.03; }
+    if (m === 'sleep') cy += u * 0.03;
     if (m === 'listen') { sy = 1.03; cy -= u * 0.03; }
     if (m === 'think') rot = Math.sin(t * 1.3) * 0.05;
     if (m === 'write') rot = 0.06;
     if (m === 'happy') {
-      const ph = (t * 2.4) % 1;
+      const ph = frac(t * 2.4);
       const jump = Math.sin(ph * Math.PI);
       cy -= jump * u * 0.18;
       const squash = ph < 0.1 || ph > 0.93 ? 0.08 : 0;
@@ -269,6 +284,18 @@ export class Character {
       sy = 1 - (1 - beat) * 0.05;
     }
     if (m === 'eat') sy = 1 + 0.1 * Math.sin(age * 14) * Math.exp(-age * 2);
+    if (m === 'work') { cy += Math.abs(Math.sin(t * 9)) * u * 0.012; rot = 0.03; }
+    if (m === 'search') { rot = 0.07 + Math.sin(t * 1.6) * 0.03; cx += Math.sin(t * 1.6) * u * 0.04; }
+    if (m === 'ready') cy += Math.sin(t * 2) * u * 0.02;
+    if (m === 'help') rot = -0.04;
+    if (m === 'carry') { cy -= Math.abs(Math.sin(t * 7)) * u * 0.06; rot = 0.05 + Math.sin(t * 7) * 0.025; }
+    if (m === 'near') { cx += u * 0.55; cy += u * 0.1; }
+    if (m === 'away') {
+      const k = clamp(age / 1.4, 0, 1);
+      const sc = 1 - 0.3 * k;
+      sx = sc; sy = sc;
+      cy += -u * 0.25 * k + Math.sin(t * 2.2) * u * 0.035;
+    }
 
     const target = m === 'idle' && this.idleLight ? this.idleLight : m === 'dance' ? [127 + 127 * Math.sin(t * 3), 127 + 127 * Math.sin(t * 3 + 2), 127 + 127 * Math.sin(t * 3 + 4)] : LIGHT[m];
     this.light = mix(this.light, target, 0.12);
@@ -285,6 +312,12 @@ export class Character {
     if (m === 'meet') lt = { x: -1, y: 0.2 };
     if (m === 'eat') lt = { x: 0, y: -0.9 };
     if (m === 'poke') lt = { x: 0, y: 0 };
+    if (m === 'work') lt = { x: -0.35, y: 0.75 };
+    if (m === 'search') lt = { x: 0.85, y: 0.35 };
+    if (m === 'help') lt = { x: -0.9, y: -0.1 };
+    if (m === 'carry') lt = { x: 0.6, y: 0 };
+    if (m === 'near') lt = { x: -0.5, y: 0.1 };
+    if (m === 'ready') lt = { x: 0, y: 0.1 };
     this.look.x += (lt.x - this.look.x) * 0.12;
     this.look.y += (lt.y - this.look.y) * 0.12;
 
@@ -309,15 +342,26 @@ export class Character {
     ctx.rotate(rot);
     ctx.scale(sx, sy);
 
-    this.drawBackpack(u);
-    this.drawBody(u, t);
-    this.drawArms(u, t);
-    if (m === 'write') this.drawTablet(u, t);
-    this.drawAntenna(u, t);
-    this.drawHood(u);
-    this.drawFace(u, t, blinking);
-    this.drawOutfit(u, t);
-    if (m === 'wave') this.drawArms(u, t, true);
+    if (m === 'sleep') this.drawRest(u, t);
+    else if (m === 'away') this.drawBack(u, t);
+    else {
+      if (m === 'help') this.drawChecklist(u, age);
+      this.drawBackpack(u);
+      this.drawBody(u, t);
+      this.drawArms(u, t);
+      if (m === 'write') this.drawTablet(u, t);
+      this.drawAntenna(u, t);
+      this.drawHood(u);
+      this.drawFace(u, t, blinking);
+      if (m === 'listen') this.drawHeadphones(u);
+      else this.drawOutfit(u, t);
+      if (m === 'wave' || m === 'think' || m === 'help' || m === 'search') this.drawArms(u, t, true);
+      if (m === 'work') this.drawLaptop(u, t);
+      if (m === 'ready') this.drawPad(u, t);
+      if (m === 'carry') this.drawBoxes(u, t);
+      if (m === 'search') this.drawLens(u, t);
+      if (m === 'near') this.drawMug(u, -u * 1.22, u * 0.18, u * 0.92, true);
+    }
 
     ctx.restore();
 
@@ -348,9 +392,10 @@ export class Character {
     const { ctx } = this;
     // ботинки
     ctx.fillStyle = '#0d0d10';
+    const walk = this.mood === 'carry' ? Math.sin(t * 7) : 0;
     for (const s of [-1, 1]) {
       ctx.beginPath();
-      ctx.ellipse(s * u * 0.24, u * 1.02, u * 0.22, u * 0.13, 0, 0, Math.PI * 2);
+      ctx.ellipse(s * u * 0.24 + s * walk * u * 0.1, u * 1.02 - Math.max(0, s * walk) * u * 0.08, u * 0.22, u * 0.13, 0, 0, Math.PI * 2);
       ctx.fill();
       ctx.fillStyle = 'rgba(255,255,255,0.10)';
       ctx.fillRect(s * u * 0.24 - u * 0.16, u * 1.04, u * 0.32, u * 0.025);
@@ -431,7 +476,29 @@ export class Character {
       else arm(-1, l);
       return;
     }
+    if (m === 'think') {
+      // рука у подбородка — поверх маски
+      if (front) arm(1, 1.95 + Math.sin(t * 1.3) * 0.04, 0.48);
+      else arm(-1, 0.3);
+      return;
+    }
+    if (m === 'help') {
+      // показывает на список слева
+      if (front) arm(-1, 2.05 + Math.sin(t * 3) * 0.08, 0.5);
+      else arm(1, -0.25);
+      return;
+    }
+    if (m === 'search') {
+      // правая рука держит лупу
+      if (front) arm(1, -0.55, 0.5);
+      else arm(-1, 0.35);
+      return;
+    }
     if (front) return;
+    if (m === 'work') { const k = Math.sin(t * 18) * 0.06; l = -0.75 + k; r = 0.75 + k; }
+    if (m === 'ready') { l = -0.55; r = 0.55; }
+    if (m === 'carry') { l = -0.95; r = 0.95; }
+    if (m === 'near') { l = 0.3; r = -1.9; }
     if (m === 'dance') {
       const ph = Math.sin(t * Math.PI * 1.05);
       l = 1.2 + ph * 1.2;
@@ -608,7 +675,7 @@ export class Character {
       if (m === 'sleep' || blinking) {
         ctx.lineWidth = u * 0.06;
         ctx.beginPath();
-        if (m === 'sleep') ctx.arc(x, y - u * 0.04, u * 0.1, Math.PI * 0.2, Math.PI * 0.8);
+        if (m === 'sleep') ctx.arc(x, y - u * 0.04, u * 0.1, Math.PI * 0.15, Math.PI * 0.85);
         else {
           ctx.moveTo(x - u * 0.09, y);
           ctx.lineTo(x + u * 0.09, y);
@@ -830,7 +897,7 @@ export class Character {
     const every = m === 'sleep' ? 1400 : m === 'happy' ? 500 : m === 'angry' ? 260 : m === 'dance' ? 420 : 0;
     if (every && now - this.lastSpawn > every) {
       this.lastSpawn = now;
-      if (m === 'sleep') this.spawn({ kind: 'z', x: cx + u * 0.55, y: cy - u * 1.1, vx: u * 0.15, vy: -u * 0.35, life: 2.6 });
+      if (m === 'sleep') this.spawn({ kind: 'z', x: cx + u * 0.75, y: cy - u * 0.55, vx: u * 0.15, vy: -u * 0.35, life: 2.6 });
       if (m === 'happy') this.spawn({ kind: 'heart', x: cx + (Math.random() - 0.5) * u * 1.4, y: cy - u * 1.0, vx: (Math.random() - 0.5) * u * 0.3, vy: -u * 0.55, life: 1.4 });
       if (m === 'dance') this.spawn({ kind: 'note', x: cx + (Math.random() - 0.5) * u * 1.6, y: cy - u * 0.9, vx: (Math.random() - 0.5) * u * 0.3, vy: -u * 0.5, life: 1.6, color: rgb(this.light) });
       if (m === 'angry')
@@ -895,12 +962,22 @@ export class Character {
         ctx.restore();
       }
     }
-    if (m === 'think') {
+    if (m === 'think') this.bubble(cx + u * 1.02, cy - u * 0.95, u, (bx, by) => {
       for (let i = 0; i < 3; i++) {
-        const ph = (now / 1000) * 4 - i * 0.6;
-        ctx.fillStyle = `rgba(255,255,255,${0.3 + 0.7 * Math.max(0, Math.sin(ph))})`;
+        const ph = (now / 1000) * 5 - i * 0.7;
+        ctx.fillStyle = `rgba(255,255,255,${0.35 + 0.65 * Math.max(0, Math.sin(ph))})`;
         ctx.beginPath();
-        ctx.arc(cx - u * (0.75 + i * 0.25), cy - u * (1.05 + i * 0.12), u * (0.06 + i * 0.02), 0, Math.PI * 2);
+        ctx.arc(bx + (i - 1) * u * 0.15, by, u * 0.05, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    });
+    if (m === 'search') this.floatingCards(cx, cy, u, now / 1000);
+    if (m === 'carry') {
+      for (let i = 0; i < 3; i++) {
+        const k = frac((now / 1000) * 1.4 + i / 3);
+        ctx.fillStyle = `rgba(200,200,215,${0.35 * (1 - k)})`;
+        ctx.beginPath();
+        ctx.arc(cx - u * (0.55 + k * 0.6), cy + u * (1.05 - k * 0.15), u * (0.05 + k * 0.08), 0, Math.PI * 2);
         ctx.fill();
       }
     }
@@ -912,8 +989,17 @@ export class Character {
       ctx.textAlign = 'start';
     }
     if (m === 'listen') {
+      this.bubble(cx - u * 1.12, cy - u * 0.35, u, (bx, by) => {
+        for (let i = 0; i < 5; i++) {
+          const hgt = u * (0.06 + 0.13 * Math.abs(Math.sin(now / 160 + i * 1.3)));
+          ctx.fillStyle = rgb(LIGHT.listen, 0.95);
+          ctx.beginPath();
+          ctx.roundRect(bx + (i - 2) * u * 0.085 - u * 0.025, by - hgt / 2, u * 0.05, hgt, u * 0.025);
+          ctx.fill();
+        }
+      }, true);
       for (let i = 0; i < 2; i++) {
-        const k = ((now / 1000) * 0.9 + i * 0.5) % 1;
+        const k = frac((now / 1000) * 0.9 + i * 0.5);
         ctx.strokeStyle = rgb(LIGHT.listen, (1 - k) * 0.6);
         ctx.lineWidth = u * 0.04;
         ctx.beginPath();
@@ -922,4 +1008,375 @@ export class Character {
       }
     }
   }
+
+  // ---------- Позы и предметы ----------
+
+  /** Облачко-пузырь с хвостиком; содержимое рисует fill(bx, by) — центр облачка. */
+  private bubble(x: number, y: number, u: number, fill: (bx: number, by: number) => void, tailRight = false) {
+    const { ctx } = this;
+    const w = u * 0.62, h = u * 0.36;
+    ctx.save();
+    ctx.fillStyle = 'rgba(40,44,60,0.92)';
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = u * 0.02;
+    ctx.beginPath();
+    ctx.roundRect(x - w / 2, y - h / 2, w, h, h / 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    const tx = tailRight ? x + w * 0.3 : x - w * 0.3;
+    ctx.moveTo(tx - u * 0.05, y + h / 2 - u * 0.01);
+    ctx.lineTo(tx + (tailRight ? u * 0.1 : -u * 0.1), y + h / 2 + u * 0.12);
+    ctx.lineTo(tx + u * 0.06, y + h / 2 - u * 0.01);
+    ctx.fill();
+    ctx.restore();
+    fill(x, y);
+  }
+
+  private glassCard(x: number, y: number, w: number, h: number, u: number) {
+    const { ctx } = this;
+    ctx.fillStyle = 'rgba(120,170,255,0.16)';
+    ctx.strokeStyle = 'rgba(160,200,255,0.6)';
+    ctx.lineWidth = u * 0.02;
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, u * 0.05);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  /** Летающие карточки «папка, документ, глобус» — когда Тук ищет. */
+  private floatingCards(cx: number, cy: number, u: number, t: number) {
+    const { ctx } = this;
+    const cards = [
+      { x: -1.42, y: -0.95, k: 'folder' },
+      { x: -1.6, y: -0.2, k: 'doc' },
+      { x: -1.05, y: -0.45, k: 'globe' },
+    ];
+    cards.forEach((c, i) => {
+      const x = cx + u * c.x, y = cy + u * c.y + Math.sin(t * 2 + i * 1.7) * u * 0.06;
+      const w = u * 0.42, h = u * 0.42;
+      this.glassCard(x, y, w, h, u);
+      ctx.strokeStyle = 'rgba(200,225,255,0.9)';
+      ctx.fillStyle = 'rgba(200,225,255,0.9)';
+      ctx.lineWidth = u * 0.025;
+      const mx = x + w / 2, my = y + h / 2;
+      if (c.k === 'folder') {
+        ctx.beginPath();
+        ctx.roundRect(mx - u * 0.13, my - u * 0.07, u * 0.26, u * 0.17, u * 0.02);
+        ctx.fill();
+        ctx.fillRect(mx - u * 0.13, my - u * 0.11, u * 0.1, u * 0.05);
+      } else if (c.k === 'doc') {
+        for (let j = 0; j < 4; j++) ctx.fillRect(mx - u * 0.12, my - u * 0.11 + j * u * 0.07, u * (j === 3 ? 0.14 : 0.24), u * 0.025);
+      } else {
+        ctx.beginPath();
+        ctx.arc(mx, my, u * 0.12, 0, Math.PI * 2);
+        ctx.moveTo(mx - u * 0.12, my);
+        ctx.lineTo(mx + u * 0.12, my);
+        ctx.moveTo(mx, my - u * 0.12);
+        ctx.ellipse(mx, my, u * 0.05, u * 0.12, 0, -Math.PI / 2, Math.PI * 1.5);
+        ctx.stroke();
+      }
+    });
+  }
+
+  /** Лупа в правой руке. */
+  private drawLens(u: number, t: number) {
+    const { ctx } = this;
+    const hx = u * 0.78, hy = u * 0.72;
+    const lx = u * 0.66 + Math.sin(t * 1.6) * u * 0.05, ly = u * 0.3;
+    ctx.strokeStyle = '#2a2a31';
+    ctx.lineWidth = u * 0.07;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(hx, hy);
+    ctx.lineTo(lx + u * 0.14, ly + u * 0.22);
+    ctx.stroke();
+    const g = ctx.createRadialGradient(lx - u * 0.06, ly - u * 0.06, u * 0.02, lx, ly, u * 0.22);
+    g.addColorStop(0, 'rgba(220,240,255,0.55)');
+    g.addColorStop(1, 'rgba(140,190,255,0.18)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(lx, ly, u * 0.27, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#3a3a44';
+    ctx.lineWidth = u * 0.05;
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+    ctx.lineWidth = u * 0.02;
+    ctx.beginPath();
+    ctx.arc(lx, ly, u * 0.18, Math.PI * 1.1, Math.PI * 1.5);
+    ctx.stroke();
+  }
+
+  /** Ноутбук перед Туком (крышка к зрителю, логотип «Т»). */
+  private drawLaptop(u: number, t: number) {
+    const { ctx } = this;
+    // свет экрана на маске
+    ctx.fillStyle = rgb(this.light, 0.1 + 0.04 * Math.sin(t * 6));
+    ctx.beginPath();
+    ctx.ellipse(0, u * 0.1, u * 0.6, u * 0.32, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // клавиатура
+    ctx.fillStyle = '#2a2b31';
+    ctx.beginPath();
+    ctx.moveTo(-u * 0.82, u * 1.0);
+    ctx.lineTo(u * 0.62, u * 1.0);
+    ctx.lineTo(u * 0.52, u * 0.93);
+    ctx.lineTo(-u * 0.72, u * 0.93);
+    ctx.closePath();
+    ctx.fill();
+    // крышка
+    const g = ctx.createLinearGradient(-u * 0.7, u * 0.35, u * 0.5, u * 0.95);
+    g.addColorStop(0, '#5a5c66');
+    g.addColorStop(1, '#2c2d34');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.roundRect(-u * 0.72, u * 0.4, u * 1.24, u * 0.56, u * 0.05);
+    ctx.fill();
+    ctx.strokeStyle = rgb(this.light, 0.55);
+    ctx.lineWidth = u * 0.02;
+    ctx.beginPath();
+    ctx.moveTo(-u * 0.68, u * 0.405);
+    ctx.lineTo(u * 0.48, u * 0.405);
+    ctx.stroke();
+    // логотип
+    ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+    ctx.lineWidth = u * 0.04;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(-u * 0.19, u * 0.6);
+    ctx.lineTo(-u * 0.01, u * 0.6);
+    ctx.moveTo(-u * 0.1, u * 0.6);
+    ctx.lineTo(-u * 0.1, u * 0.77);
+    ctx.stroke();
+  }
+
+  /** Планшет у груди — «готов к следующей задаче». */
+  private drawPad(u: number, t: number) {
+    const { ctx } = this;
+    ctx.save();
+    ctx.translate(u * 0.12, u * 0.72);
+    ctx.rotate(-0.12);
+    ctx.fillStyle = '#26272e';
+    ctx.beginPath();
+    ctx.roundRect(-u * 0.32, -u * 0.22, u * 0.64, u * 0.44, u * 0.05);
+    ctx.fill();
+    ctx.fillStyle = '#121318';
+    ctx.fillRect(-u * 0.27, -u * 0.17, u * 0.54, u * 0.34);
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = u * 0.035;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(-u * 0.09, -u * 0.06);
+    ctx.lineTo(u * 0.09, -u * 0.06);
+    ctx.moveTo(0, -u * 0.06);
+    ctx.lineTo(0, u * 0.09);
+    ctx.stroke();
+    if (Math.sin(t * 5) > 0) {
+      ctx.fillStyle = rgb(this.light, 0.9);
+      ctx.fillRect(u * 0.14, u * 0.06, u * 0.06, u * 0.025);
+    }
+    ctx.restore();
+  }
+
+  /** Стопка коробок в руках — «выполняет». */
+  private drawBoxes(u: number, t: number) {
+    const { ctx } = this;
+    const bob = Math.sin(t * 7) * u * 0.015;
+    const boxes = [
+      { x: -0.5, y: 0.74, w: 0.98, h: 0.3 },
+      { x: -0.44, y: 0.47, w: 0.88, h: 0.27 },
+      { x: -0.38, y: 0.24, w: 0.78, h: 0.23 },
+    ];
+    for (const b of boxes) {
+      const y = u * b.y + bob;
+      const g = ctx.createLinearGradient(0, y, 0, y + u * b.h);
+      g.addColorStop(0, '#f1ece2');
+      g.addColorStop(1, '#c9c2b4');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.roundRect(u * b.x + u * 0.05, y, u * b.w, u * b.h, u * 0.03);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(120,105,80,0.35)';
+      ctx.fillRect(u * b.x + u * 0.05, y + u * b.h * 0.45, u * b.w, u * 0.02);
+    }
+    // руки по бокам стопки
+    ctx.fillStyle = '#0b0b0e';
+    for (const sd of [-1, 1]) {
+      ctx.beginPath();
+      ctx.arc(u * 0.04 + sd * u * 0.52, u * 0.66 + bob, u * 0.1, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  /** Прозрачная панель со списком; галочки появляются по очереди. */
+  private drawChecklist(u: number, age: number) {
+    const { ctx } = this;
+    const x = -u * 1.62, y = -u * 0.62, w = u * 0.78, h = u * 0.98;
+    this.glassCard(x, y, w, h, u);
+    const step = (((age % 3.2) + 3.2) % 3.2) / 0.7;
+    for (let i = 0; i < 3; i++) {
+      const ry = y + u * 0.2 + i * u * 0.28;
+      ctx.strokeStyle = 'rgba(200,225,255,0.85)';
+      ctx.lineWidth = u * 0.025;
+      ctx.beginPath();
+      ctx.roundRect(x + u * 0.1, ry - u * 0.08, u * 0.16, u * 0.16, u * 0.03);
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(200,225,255,0.7)';
+      ctx.fillRect(x + u * 0.34, ry - u * 0.02, u * 0.34, u * 0.04);
+      if (step > i + 0.3) {
+        ctx.strokeStyle = '#7cf0b4';
+        ctx.lineWidth = u * 0.04;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(x + u * 0.13, ry);
+        ctx.lineTo(x + u * 0.17, ry + u * 0.04);
+        ctx.lineTo(x + u * 0.24, ry - u * 0.05);
+        ctx.stroke();
+      }
+    }
+  }
+
+  /** Большая кружка с «Т»; front — Тук выглядывает из-за неё (рука на краю). */
+  private drawMug(u: number, x: number, y: number, size: number, hand = false) {
+    const { ctx } = this;
+    const w = size, h = size * 1.0;
+    // ручка
+    ctx.strokeStyle = '#1b1b20';
+    ctx.lineWidth = size * 0.11;
+    ctx.beginPath();
+    ctx.arc(x - w * 0.02, y + h * 0.5, h * 0.24, Math.PI * 0.5, Math.PI * 1.5);
+    ctx.stroke();
+    const g = ctx.createLinearGradient(x, 0, x + w, 0);
+    g.addColorStop(0, '#2a2a31');
+    g.addColorStop(0.45, '#1a1a1f');
+    g.addColorStop(1, '#0c0c0f');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, [size * 0.04, size * 0.04, size * 0.12, size * 0.12]);
+    ctx.fill();
+    ctx.fillStyle = '#0a0a0c';
+    ctx.beginPath();
+    ctx.ellipse(x + w / 2, y + size * 0.02, w / 2, size * 0.05, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+    ctx.lineWidth = size * 0.07;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x + w * 0.34, y + h * 0.36);
+    ctx.lineTo(x + w * 0.66, y + h * 0.36);
+    ctx.moveTo(x + w * 0.5, y + h * 0.36);
+    ctx.lineTo(x + w * 0.5, y + h * 0.66);
+    ctx.stroke();
+    if (hand) {
+      ctx.fillStyle = '#0b0b0e';
+      ctx.beginPath();
+      ctx.arc(x + w * 0.98, y + size * 0.04, u * 0.1, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  private drawHeadphones(u: number) {
+    const { ctx } = this;
+    ctx.strokeStyle = '#2b2b33';
+    ctx.lineWidth = u * 0.09;
+    ctx.beginPath();
+    ctx.arc(0, -u * 0.2, u * 0.95, Math.PI * 1.08, Math.PI * 1.92);
+    ctx.stroke();
+    for (const sd of [-1, 1]) {
+      ctx.fillStyle = '#1f1f26';
+      ctx.beginPath();
+      ctx.roundRect(sd * u * 0.95 - u * 0.15, -u * 0.32, u * 0.3, u * 0.42, u * 0.12);
+      ctx.fill();
+      ctx.fillStyle = rgb(this.light, 0.8);
+      ctx.beginPath();
+      ctx.arc(sd * u * 0.95, -u * 0.11, u * 0.05, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  /** «Отдыхает»: лежит, голова на полу, тело позади, рядом кружка. */
+  private drawRest(u: number, t: number) {
+    const { ctx } = this;
+    const breathe = Math.sin(t * 1.4) * u * 0.015;
+    ctx.save();
+    ctx.translate(u * 0.5, 0);
+    // тело лёжа позади головы
+    ctx.fillStyle = this.fabric(u * 0.4, u * 1.1, 0.14);
+    ctx.beginPath();
+    ctx.ellipse(-u * 0.95, u * 0.82 + breathe, u * 0.85, u * 0.3, -0.05, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#121216';
+    ctx.beginPath();
+    ctx.roundRect(-u * 1.35, u * 0.42 + breathe, u * 0.62, u * 0.3, u * 0.1);
+    ctx.fill();
+    this.patch(-u * 1.12, u * 0.48 + breathe, u * 0.16, u * 0.12);
+    ctx.fillStyle = '#0d0d10';
+    ctx.beginPath();
+    ctx.ellipse(-u * 1.78, u * 0.92, u * 0.16, u * 0.12, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // голова лежит на полу
+    ctx.save();
+    ctx.translate(u * 0.1, u * 0.5);
+    ctx.rotate(0.12);
+    ctx.scale(0.92, 0.92);
+    this.drawAntenna(u, t);
+    this.drawHood(u);
+    this.drawFace(u, t, false);
+    this.drawOutfitHead(u, t);
+    ctx.restore();
+    this.drawMug(u, u * 0.95, u * 0.6, u * 0.42);
+    ctx.restore();
+  }
+
+  /** «Уходит в фон»: вид сзади — капюшон и рюкзак с «Т». */
+  private drawBack(u: number, t: number) {
+    const { ctx } = this;
+    // огонёк-«двигатель» под ногами
+    const g = ctx.createRadialGradient(0, u * 1.15, 0, 0, u * 1.15, u * 0.5);
+    g.addColorStop(0, rgb(this.light, 0.55));
+    g.addColorStop(1, rgb(this.light, 0));
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(0, u * 1.15, u * 0.5, 0, Math.PI * 2);
+    ctx.fill();
+    this.drawBody(u, t);
+    this.drawArms(u, t);
+    this.drawAntenna(u, t);
+    // капюшон сзади без лица
+    const hg = ctx.createRadialGradient(-u * 0.3, -u * 0.7, u * 0.1, 0, -u * 0.2, u * 1.15);
+    hg.addColorStop(0, rgb(mix(this.hood, [255, 255, 255], 0.12)));
+    hg.addColorStop(0.6, rgb(this.hood));
+    hg.addColorStop(1, rgb(mix(this.hood, [0, 0, 0], 0.7)));
+    ctx.fillStyle = hg;
+    ctx.beginPath();
+    ctx.moveTo(0, -u * 1.05);
+    ctx.bezierCurveTo(u * 0.66, -u * 1.05, u * 1.0, -u * 0.6, u * 0.98, -u * 0.1);
+    ctx.bezierCurveTo(u * 0.97, u * 0.25, u * 0.75, u * 0.45, u * 0.42, u * 0.42);
+    ctx.lineTo(-u * 0.42, u * 0.42);
+    ctx.bezierCurveTo(-u * 0.75, u * 0.45, -u * 0.97, u * 0.25, -u * 0.98, -u * 0.1);
+    ctx.bezierCurveTo(-u * 1.0, -u * 0.6, -u * 0.66, -u * 1.05, 0, -u * 1.05);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.lineWidth = u * 0.03;
+    ctx.beginPath();
+    ctx.moveTo(0, -u * 1.0);
+    ctx.quadraticCurveTo(u * 0.05, -u * 0.3, 0, u * 0.4);
+    ctx.stroke();
+    // рюкзак
+    ctx.fillStyle = '#16161b';
+    ctx.beginPath();
+    ctx.roundRect(-u * 0.4, u * 0.28, u * 0.8, u * 0.66, u * 0.12);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = u * 0.02;
+    ctx.stroke();
+    this.patch(-u * 0.15, u * 0.46, u * 0.3, u * 0.22);
+  }
+
+  /** Наряды на голове (для позы лёжа). */
+  private drawOutfitHead(u: number, t: number) {
+    if (this.outfit === 'santa' || this.outfit === 'glasses' || this.outfit === 'crown' || this.outfit === 'flowers' || this.outfit === 'headphones') this.drawOutfit(u, t);
+  }
+
 }

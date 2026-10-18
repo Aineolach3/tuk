@@ -292,3 +292,5 @@ html.drop #view { max-height: 44vh; padding-bottom: 14px; }
 html.drop #tabs { justify-content: flex-start; gap: 6px; }
 @keyframes dropin { from { transform: scaleY(0.2) translateY(-20px); opacity: 0; } to { transform: none; opacity: 1; } }
 @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+.progress { height: 6px; border-radius: 3px; background: var(--card2); overflow: hidden; margin: 8px 0 4px; }
+.progress i { display: block; height: 100%; background: var(--accent); transition: width 0.4s; }

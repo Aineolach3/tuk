@@ -39,6 +39,7 @@ export interface Settings {
   lightColor?: string;
   dance?: boolean; // танцевать под музыку
   island?: boolean; // Android: Тук над приложениями
+  wake?: boolean; // Android: слушать «Тук Тук»
   voiceLoop?: boolean; // продолжать разговор голосом после ответа
 }
 

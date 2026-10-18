@@ -261,9 +261,11 @@ export interface IslandArgs {
   data?: string;
   frames?: number;
   fps?: number;
+  show?: boolean;
+  wake?: boolean;
 }
 
-/** Остров поверх приложений: check | grant | start | stop | update | sprite | consume | back. */
+/** Остров поверх приложений: check | grant | config | download | update | sprite | consume | back. */
 export async function island(action: string, args: IslandArgs = {}): Promise<any> {
   if (kind !== 'android') return null;
   return invoke('plugin:tuk|island', { action, ...args });

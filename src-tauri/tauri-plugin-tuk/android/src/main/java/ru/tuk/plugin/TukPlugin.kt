@@ -34,6 +34,8 @@ class IslandArgs {
     var data: String? = null
     var frames: Int? = null
     var fps: Int? = null
+    var show: Boolean? = null
+    var wake: Boolean? = null
 }
 
 @InvokeArg
@@ -77,6 +79,17 @@ class TukPlugin(private val activity: Activity) : Plugin(activity) {
 
     // ---------------- Остров ----------------
 
+    private fun micGranted(): Boolean =
+        ContextCompat.checkSelfPermission(activity, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun askNotifications() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 4712)
+        }
+    }
+
     private fun canDraw(): Boolean = Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(activity)
 
     @Command
@@ -87,6 +100,31 @@ class TukPlugin(private val activity: Activity) : Plugin(activity) {
             "check" -> {
                 r.put("granted", canDraw())
                 r.put("running", Island.service != null)
+                r.put("mic", micGranted())
+                r.put("model", Wake.status(activity))
+                r.put("progress", Wake.progress)
+                Wake.error?.let { r.put("error", it) }
+            }
+            "download" -> Wake.download(activity)
+            "config" -> {
+                val show = a.show ?: true
+                val wake = a.wake ?: false
+                if (!show && !wake) {
+                    activity.stopService(Intent(activity, IslandService::class.java))
+                } else {
+                    if (!canDraw()) {
+                        invoke.reject("Нет разрешения «Поверх других приложений»")
+                        return
+                    }
+                    if (wake && !micGranted()) {
+                        ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.RECORD_AUDIO), 4711)
+                        invoke.reject("Разрешите доступ к микрофону и включите ещё раз")
+                        return
+                    }
+                    askNotifications()
+                    val i = Intent(activity, IslandService::class.java).putExtra("show", show).putExtra("wake", wake)
+                    ContextCompat.startForegroundService(activity, i)
+                }
             }
             "grant" -> {
                 val i = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + activity.packageName))
@@ -98,11 +136,7 @@ class TukPlugin(private val activity: Activity) : Plugin(activity) {
                     invoke.reject("Нет разрешения «Поверх других приложений»")
                     return
                 }
-                if (Build.VERSION.SDK_INT >= 33 &&
-                    ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 4712)
-                }
+                askNotifications()
                 ContextCompat.startForegroundService(activity, Intent(activity, IslandService::class.java))
             }
             "stop" -> activity.stopService(Intent(activity, IslandService::class.java))
@@ -123,7 +157,9 @@ class TukPlugin(private val activity: Activity) : Plugin(activity) {
             }
             "consume" -> {
                 r.put("drop", Island.drop)
+                Island.cmd?.let { r.put("cmd", it) }
                 Island.drop = false
+                Island.cmd = null
             }
             "back" -> activity.moveTaskToBack(true)
         }
@@ -150,6 +186,7 @@ class TukPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     private fun finish(text: String?, error: String?) {
+        if (listening) Island.service?.wake?.resume()
         listening = false
         val inv = pending
         pending = null
@@ -234,6 +271,7 @@ class TukPlugin(private val activity: Activity) : Plugin(activity) {
         activity.runOnUiThread {
             if (listening) finish(null, "Отменено")
             partial = ""
+            Island.service?.wake?.pause()
             listening = true
             pending = invoke
             val onDevice = Build.VERSION.SDK_INT >= 31 && runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(activity) }.getOrDefault(false)
