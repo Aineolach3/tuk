@@ -1,6 +1,9 @@
 // Главный модуль: строка с персонажем, панель, вкладки, команды.
 
-import { Character, MOOD_LABEL, type Mood } from './character.js';
+import { Character, HOOD_COLORS, LIGHT_COLORS, MOOD_LABEL, OUTFIT_LABEL, seasonalOutfit, type Mood, type Outfit } from './character.js';
+import { play, setVolume, type Sound } from './sounds.js';
+import { MAX_CHARS, readFile, type FileText } from './files.js';
+import { computeRecap, renderRecap } from './recap.js';
 import { METRIC_LABEL, healthText, type Item, type Metric } from './model.js';
 import { REPEAT_LABEL, fmtDay, fmtTime, fmtWhen, normalize, parse } from './parser.js';
 import * as P from './platform.js';
@@ -42,6 +45,9 @@ class App {
   streamText = '';
   chatAbort: AbortController | null = null;
   lastBrainRender = 0;
+  pokes: number[] = [];
+  file: FileText | null = null; // прикреплённый файл для разговора
+  lastBase: Mood = 'idle';
 
   constructor(data: Data) {
     this.store = new Store(data, P.saveData);
@@ -51,7 +57,11 @@ class App {
     st.usePcBrain ??= true;
     this.brain = new Brain(st.model);
     this.brain.onState = (b) => this.onBrainState(b);
+    st.volume ??= 0.5;
+    st.outfit ??= 'auto';
+    st.hoodColor ??= 'Чёрный';
     this.char = new Character($<HTMLCanvasElement>('#char'));
+    this.applyLook();
     document.documentElement.classList.add(P.kind);
     if (P.kind === 'web') document.documentElement.classList.add('android-like');
     this.applyMode(this.mode);
@@ -83,7 +93,9 @@ class App {
       this.setTab('settings');
     });
     await P.setAutostart(this.store.data.settings.autostart);
-    if (!this.store.items.length) this.say('Привет! Я Тук. Напишите, что записать или о чём напомнить.', 'happy', 4000);
+    this.flash('wave', 2400);
+    this.sfx('hello');
+    if (!this.store.items.length) this.say('Привет! Я Тук. Напишите, что записать или о чём напомнить.', null, 4000);
   }
 
   // ---------------- Настроение ----------------
@@ -114,7 +126,10 @@ class App {
   activity(): void {
     const wasAsleep = this.char.mood === 'sleep';
     this.lastActivity = Date.now();
-    if (wasAsleep && !this.tempMood) this.char.set('idle');
+    if (wasAsleep && !this.tempMood) {
+      this.flash('wave', 1200);
+      this.sfx('wake');
+    }
   }
 
   tick(): void {
@@ -124,12 +139,20 @@ class App {
       R.markFired(this.store, it);
       this.store.changed('fired');
       if (P.kind !== 'android') void P.notify(this.store.data.settings.name, it.text);
-      this.beep(880);
+      this.sfx('alert');
       this.flash('alert', 3000);
       if (P.kind === 'desktop') this.applyMode(this.mode === 'expanded' ? 'expanded' : 'compact');
     }
     if (this.tempMood && now > this.tempUntil) this.tempMood = null;
-    if (!this.tempMood) this.char.set(this.baseMood());
+    if (!this.tempMood) {
+      const base = this.baseMood();
+      if (base !== this.lastBase) {
+        if (base === 'angry') this.sfx('angry');
+        if (base === 'sleep') this.sfx('sleep');
+        this.lastBase = base;
+      }
+      this.char.set(base);
+    }
     if (this.reply && now > this.replyUntil) {
       this.reply = '';
       this.renderReply();
@@ -188,7 +211,7 @@ class App {
         s.add({ kind: 'reminder', text: p.text, dueAt: p.dueAt, repeat: p.repeat, tag: p.tag });
         const rep = p.repeat ? `, ${REPEAT_LABEL[p.repeat]}` : '';
         this.say(`Напомню ${fmtWhen(p.dueAt)}${rep}: «${p.text}»`, 'write', 1600);
-        this.beep(660);
+        this.sfx('write');
         break;
       }
       case 'task': {
@@ -196,7 +219,7 @@ class App {
         const when = p.dueAt ? ` на ${fmtDay(p.dueAt)}` : '';
         const extra = p.reason === 'no-time' ? ' Чтобы напомнить, добавьте время: «завтра в 9».' : '';
         this.say(`Записал задачу${when}: «${p.text}».${extra}`, 'write', 1600);
-        this.beep(660);
+        this.sfx('write');
         break;
       }
       case 'note':
@@ -267,12 +290,15 @@ class App {
     if (this.generating) return this.say('Секунду, ещё думаю над прошлым ответом…', 'think', 2000);
     const d = this.store.data;
     const chat = (d.chat ??= []);
-    chat.push({ role: 'user', content: text.trim() });
+    chat.push({ role: 'user', content: text.trim(), ts: Date.now() });
     if (chat.length > 60) chat.splice(0, chat.length - 60);
     this.store.changed('chat');
     this.setTab('chat');
 
-    const messages: ChatMsg[] = [{ role: 'system', content: systemPrompt(d.settings.name, this.contextText()) }, ...chat.slice(-12)];
+    let ctxText = this.contextText();
+    if (this.file) ctxText += `\n\nПрикреплённый файл «${this.file.name}»${this.file.truncated ? ' (начало)' : ''}:\n-----\n${this.file.text}\n-----\nОтвечай на вопросы о нём по его содержанию.`;
+    const history = chat.slice(this.file ? -6 : -12).map((m) => ({ role: m.role, content: m.content }));
+    const messages: ChatMsg[] = [{ role: 'system', content: systemPrompt(d.settings.name, ctxText) }, ...history];
     this.generating = true;
     this.streamText = '';
     this.chatAbort = new AbortController();
@@ -302,9 +328,10 @@ class App {
         );
       }
       answer = answer.trim() || '…';
-      chat.push({ role: 'assistant', content: answer });
+      chat.push({ role: 'assistant', content: answer, ts: Date.now() });
       this.store.changed('chat');
       this.flash('happy', 1500);
+      this.sfx('message');
       this.say(answer, null, Math.min(30_000, 4000 + answer.length * 60));
     } catch (e) {
       const msg = this.chatAbort?.signal.aborted ? 'Хорошо, остановился.' : String((e as Error).message ?? e);
@@ -459,23 +486,96 @@ class App {
     return parts.join(', ').replace(/^./, (c) => c.toUpperCase()) + '.';
   }
 
-  beep(freq: number): void {
-    if (!this.store.data.settings.sound) return;
+  sfx(name: Sound): void {
+    if (this.store.data.settings.sound) play(name);
+  }
+
+  /** Наряд, цвет капюшона и огонька, громкость — из настроек. */
+  applyLook(): void {
+    const st = this.store.data.settings;
+    this.char.outfit = !st.outfit || st.outfit === 'auto' ? seasonalOutfit() : st.outfit;
+    this.char.hood = HOOD_COLORS[st.hoodColor ?? 'Чёрный'] ?? HOOD_COLORS['Чёрный'];
+    this.char.idleLight = st.lightColor ? LIGHT_COLORS[st.lightColor] ?? null : null;
+    setVolume(st.volume ?? 0.5);
+  }
+
+  /** Тычок в персонажа: злится, а после трёх быстрых — кружится голова. */
+  poke(): void {
+    const now = Date.now();
+    this.pokes = this.pokes.filter((t) => now - t < 1500);
+    this.pokes.push(now);
+    if (this.pokes.length >= 3) {
+      this.pokes = [];
+      this.flash('dizzy', 2600);
+      this.sfx('dizzy');
+      this.say(['Ой-ой, всё кружится…', 'Хватит, голова кругом!', 'Мир вращается…'][Math.floor(Math.random() * 3)], null, 2400);
+    } else {
+      this.flash('poke', 900);
+      this.sfx('poke');
+    }
+  }
+
+  // ---------------- Файлы ----------------
+
+  async takeFile(f: File): Promise<void> {
+    this.activity();
+    if (P.kind === 'desktop' && this.mode !== 'expanded') this.applyMode('expanded');
+    this.flash('eat', 1400);
+    this.sfx('eat');
     try {
-      const AC = (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext);
-      const ac = (this as unknown as { ac?: AudioContext }).ac ?? new AC();
-      (this as unknown as { ac?: AudioContext }).ac = ac;
-      const o = ac.createOscillator(), g = ac.createGain();
-      o.type = 'sine';
-      o.frequency.value = freq;
-      g.gain.setValueAtTime(0.0001, ac.currentTime);
-      g.gain.exponentialRampToValueAtTime(0.12, ac.currentTime + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.25);
-      o.connect(g).connect(ac.destination);
-      o.start();
-      o.stop(ac.currentTime + 0.3);
-    } catch {
-      /* без звука */
+      this.file = await readFile(f);
+      const pages = this.file.pages ? ` (${this.file.pages} стр.)` : '';
+      const cut = this.file.truncated ? ` Прочитал первые ${MAX_CHARS} символов — больше в мою голову не влезет.` : '';
+      this.renderFileChip();
+      if (this.canTalk()) {
+        this.setTab('chat');
+        this.say(`Проглотил «${this.file.name}»${pages}.${cut} Спросите, что в нём — например, «перескажи коротко».`, null, 7000);
+      } else this.say(`Прочитал «${this.file.name}», но чтобы обсудить его, мне нужен мозг — вкладка «Чат».`, 'think', 6000);
+    } catch (e) {
+      this.file = null;
+      this.renderFileChip();
+      this.sfx('error');
+      this.say(String((e as Error).message ?? e), 'think', 5000);
+    }
+  }
+
+  renderFileChip(): void {
+    const el = $('#file-chip');
+    el.hidden = !this.file;
+    if (this.file) el.innerHTML = `<span>📎 ${esc(this.file.name)}</span><button data-act="file-drop" aria-label="Убрать файл">×</button>`;
+  }
+
+  // ---------------- Недельная сводка ----------------
+
+  showRecap(): void {
+    const st = this.store.data.settings;
+    const chatTimes = (this.store.data.chat ?? []).filter((m) => m.role === 'user' && m.ts).map((m) => m.ts!);
+    const r = computeRecap(Object.values(this.store.data.items), chatTimes);
+    const canvas = renderRecap(r, { name: st.name, hood: this.char.hood, outfit: this.char.outfit });
+    const url = canvas.toDataURL('image/png');
+    const ov = $('#overlay') as HTMLElement & { _png?: string };
+    ov.innerHTML = `<div class="sheet"><img src="${url}" alt="Недельная сводка"><div class="row">
+      ${P.kind !== 'web' ? '<button class="pill" data-act="recap-save">Сохранить картинку</button>' : ''}
+      <button class="pill ghost" data-act="overlay-close">Закрыть</button></div><p class="muted small" id="recap-note"></p></div>`;
+    ov.hidden = false;
+    ov._png = url;
+    this.store.data.recapSeen = weekKey();
+    this.store.changed('recap');
+    this.flash('happy', 2000);
+    this.sfx('done');
+  }
+
+  /** Превью нарядов в настройках — неподвижные картинки. */
+  drawWardrobe(): void {
+    for (const c of document.querySelectorAll<HTMLCanvasElement>('canvas[data-outfit]')) {
+      if (c.dataset.done === '1') continue;
+      c.dataset.done = '1';
+      const ch = new Character(c, { still: true });
+      ch.outfit = c.dataset.outfit as Outfit;
+      ch.hood = this.char.hood;
+      ch.idleLight = this.char.idleLight;
+      ch.set('idle');
+      ch.draw(performance.now());
     }
   }
 
@@ -497,6 +597,32 @@ class App {
 
     for (const ev of ['pointermove', 'pointerdown', 'keydown'] as const) document.addEventListener(ev, () => this.activity(), { passive: true });
     document.addEventListener('pointermove', (e) => this.char.lookAtScreen(e.clientX, e.clientY), { passive: true });
+
+    $('#char').addEventListener('click', (e) => {
+      if (P.kind === 'desktop' && this.mode === 'collapsed') return; // клик раскроет строку
+      e.stopPropagation();
+      this.activity();
+      this.poke();
+    });
+
+    // файлы: кнопка-скрепка и перетаскивание
+    const fileInput = $<HTMLInputElement>('#file-input');
+    $('#attach').addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files?.[0];
+      if (f) void this.takeFile(f);
+      fileInput.value = '';
+    });
+    document.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      if (this.tempMood !== 'listen') this.flash('listen', 1500);
+      if (P.kind === 'desktop' && this.mode === 'collapsed') this.applyMode('compact');
+    });
+    document.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const f = e.dataTransfer?.files?.[0];
+      if (f) void this.takeFile(f);
+    });
 
     $('#bar').addEventListener('click', (e) => {
       if ((e.target as HTMLElement).closest('[data-act]')) return;
@@ -549,6 +675,11 @@ class App {
         void P.setAutostart(t.checked);
       } else if (t.id === 'set-name') st.name = t.value.trim() || 'Тук';
       else if (t.id === 'set-usepc') st.usePcBrain = t.checked;
+      else if (t.id === 'set-volume') {
+        st.volume = +t.value / 100;
+        this.applyLook();
+        this.sfx('message');
+      }
       else if (t.id === 'set-device') this.store.data.deviceName = t.value.trim() || this.store.data.deviceName;
       else return;
       this.store.changed('settings');
@@ -567,7 +698,7 @@ class App {
           const res = R.complete(s, id);
           if (it.tag === 'здоровье') s.add({ kind: 'health', text: it.text, health: { metric: 'meds', value: 1, unit: '' } });
           this.flash('happy', 1500);
-          this.beep(990);
+          this.sfx('done');
           if (res && !res.done && res.dueAt) this.say(`Следующий раз — ${fmtWhen(res.dueAt)}`, null, 2500);
         }
         break;
@@ -614,6 +745,7 @@ class App {
           if (code) {
             await this.link.pairByCode(code);
             this.say(`Связал с ${this.store.data.sync.pcName ?? 'ПК'}!`, 'happy', 3000);
+            this.sfx('link');
           }
         } catch (e) {
           this.say(String((e as Error).message ?? e), 'angry', 4000);
@@ -640,6 +772,7 @@ class App {
         try {
           await this.link.pairByPin(ip, 47800, pin);
           this.say(`Связал с ${this.store.data.sync.pcName ?? 'ПК'}!`, 'happy', 3000);
+            this.sfx('link');
         } catch (e) {
           this.say(String((e as Error).message ?? e), 'angry', 4000);
         }
@@ -672,6 +805,46 @@ class App {
           this.store.changed('settings');
           await this.brain.switchModel(id as ModelId);
         }
+        break;
+      case 'file-drop':
+        this.file = null;
+        this.renderFileChip();
+        break;
+      case 'set-outfit':
+        this.store.data.settings.outfit = id as Outfit | 'auto';
+        this.applyLook();
+        this.flash('happy', 1200);
+        this.store.changed('settings');
+        break;
+      case 'set-hood':
+        this.store.data.settings.hoodColor = id;
+        this.applyLook();
+        this.lastHtml = '';
+        this.store.changed('settings');
+        break;
+      case 'set-light':
+        this.store.data.settings.lightColor = id || undefined;
+        this.applyLook();
+        this.lastHtml = '';
+        this.store.changed('settings');
+        break;
+      case 'recap':
+        this.showRecap();
+        break;
+      case 'recap-save': {
+        const png = ($('#overlay') as HTMLElement & { _png?: string })._png;
+        const note = document.querySelector('#recap-note');
+        try {
+          const path = await P.saveImage(`Тук-неделя-${new Date().toISOString().slice(0, 10)}.png`, png!.split(',')[1]);
+          if (note) note.textContent = `Сохранено: ${path}`;
+          this.sfx('done');
+        } catch (e) {
+          if (note) note.textContent = 'Не удалось сохранить: ' + String((e as Error).message ?? e);
+        }
+        break;
+      }
+      case 'overlay-close':
+        $('#overlay').hidden = true;
         break;
       case 'chat-stop':
         this.chatAbort?.abort();
@@ -711,6 +884,7 @@ class App {
       if (this.tab === 'settings' && this.link.pin) this.renderPin(this.link.pin.code);
     }
     if (this.tab === 'settings' && P.kind !== 'android') void this.fillQr();
+    if (this.tab === 'settings') this.drawWardrobe();
   }
 
   async fillQr(): Promise<void> {
@@ -841,6 +1015,7 @@ class App {
     h += this.section('Просрочено', ring, '', 'warn');
     h += this.section('Сегодня', [...todayRem, ...tasksToday], 'На сегодня ничего не запланировано');
     h += this.section('Без срока', noDue);
+    if (new Date(now).getDay() === 1 && this.store.data.recapSeen !== weekKey()) h += `<div class="card recap-banner"><b>Сводка за неделю готова</b><span class="muted">Что сделано, здоровье, серия дней</span><button class="pill small" data-act="recap">Посмотреть</button></div>`;
     h += this.healthChips();
     if (!s.items.length) h += this.examplesHtml();
     return h;
@@ -954,6 +1129,15 @@ class App {
       <label class="field"><span>Имя помощника</span><input id="set-name" value="${esc(st.name)}"></label>
       <label class="field"><span>Имя этого устройства</span><input id="set-device" value="${esc(d.deviceName)}"></label>
       <label class="toggle"><input type="checkbox" id="set-sound" ${st.sound ? 'checked' : ''}> Звуки</label>
+      <label class="field"><span>Громкость</span><input type="range" id="set-volume" min="0" max="100" value="${Math.round((st.volume ?? 0.5) * 100)}"></label>
+      <h3>Гардероб</h3>
+      <div class="wardrobe">${(['auto', ...Object.keys(OUTFIT_LABEL)] as (Outfit | 'auto')[]).map((o) => `<button class="look ${(st.outfit ?? 'auto') === o ? 'on' : ''}" data-act="set-outfit" data-id="${o}"><canvas data-outfit="${o === 'auto' ? seasonalOutfit() : o}"></canvas><span>${o === 'auto' ? 'По сезону' : esc(OUTFIT_LABEL[o])}</span></button>`).join('')}</div>
+      <p class="muted small">Цвет капюшона</p>
+      <div class="swatches">${Object.entries(HOOD_COLORS).map(([n, c]) => `<button class="sw ${st.hoodColor === n ? 'on' : ''}" data-act="set-hood" data-id="${esc(n)}" title="${esc(n)}" style="background:rgb(${c.join(',')})"></button>`).join('')}</div>
+      <p class="muted small">Огонёк в покое</p>
+      <div class="swatches"><button class="sw auto ${!st.lightColor ? 'on' : ''}" data-act="set-light" data-id="" title="Как задумано">✦</button>${Object.entries(LIGHT_COLORS).map(([n, c]) => `<button class="sw ${st.lightColor === n ? 'on' : ''}" data-act="set-light" data-id="${esc(n)}" title="${esc(n)}" style="background:rgb(${c.join(',')})"></button>`).join('')}</div>
+      <h3>Сводка</h3>
+      <button class="pill ghost" data-act="recap">Сводка за неделю</button>
       ${P.kind === 'desktop' ? `<label class="toggle"><input type="checkbox" id="set-autostart" ${st.autostart ? 'checked' : ''}> Запускать вместе с Windows</label><p class="muted">Открыть строку: Ctrl+Alt+Пробел. Свернуть: Esc.</p>` : ''}
       <h3>Состояния персонажа</h3><div class="moods-demo">${moods}</div>
       ${P.kind === 'desktop' ? '<button class="pill ghost" data-act="quit">Выйти из Тука</button>' : ''}
@@ -984,3 +1168,11 @@ async function main() {
 void main();
 
 export type { Item };
+
+/** Ключ недели (год-номер понедельника), чтобы сводку показывать раз в неделю. */
+function weekKey(t = Date.now()): string {
+  const d = new Date(t);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return d.toISOString().slice(0, 10);
+}

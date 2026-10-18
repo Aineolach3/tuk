@@ -33,6 +33,10 @@ export interface Settings {
   sleepAfterSec: number;
   model?: ModelId; // какой мозг
   usePcBrain?: boolean; // телефон: думать на ПК, когда он рядом
+  volume?: number; // 0..1
+  outfit?: import('./character.js').Outfit | 'auto';
+  hoodColor?: string;
+  lightColor?: string;
 }
 
 export interface Data {
@@ -45,6 +49,7 @@ export interface Data {
   sync: SyncState;
   settings: Settings;
   chat?: ChatMsg[]; // история разговора (только на этом устройстве)
+  recapSeen?: string; // неделя, сводку за которую уже показали
 }
 
 export function emptyData(deviceName: string): Data {

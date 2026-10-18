@@ -49,6 +49,7 @@ export type BrainState =
 export interface ChatMsg {
   role: 'system' | 'user' | 'assistant';
   content: string;
+  ts?: number; // время сообщения (для сводки), в модель не отправляется
 }
 
 export interface Engine {

@@ -180,6 +180,12 @@ export async function setAutostart(on: boolean): Promise<void> {
   if (kind === 'desktop') await invoke('set_autostart', { enabled: on }).catch(() => {});
 }
 
+/** Сохранить картинку (base64 PNG) в «Изображения» или «Загрузки». Возвращает путь. */
+export async function saveImage(name: string, base64: string): Promise<string> {
+  if (!T) throw new Error('В демо-режиме сохранить нельзя — сделайте снимок экрана');
+  return invoke('save_image', { name, base64 });
+}
+
 export async function quit(): Promise<void> {
   if (T) await invoke('quit_app');
 }

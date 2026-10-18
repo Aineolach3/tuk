@@ -93,6 +93,25 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Сохранить картинку (base64 PNG): «Изображения», иначе «Загрузки», иначе папка приложения.
+#[tauri::command]
+fn save_image(app: AppHandle, name: String, base64: String) -> Result<String, String> {
+    let bytes = net::b64decode(&base64).ok_or("Повреждённая картинка")?;
+    let safe: String = name.chars().map(|c| if "/\\:*?\"<>|".contains(c) { '_' } else { c }).collect();
+    let p = app.path();
+    let dirs = [p.picture_dir().ok(), p.download_dir().ok(), p.app_data_dir().ok()];
+    let mut last = String::from("нет подходящей папки");
+    for dir in dirs.into_iter().flatten() {
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join(&safe);
+        match std::fs::write(&file, &bytes) {
+            Ok(_) => return Ok(file.display().to_string()),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(last)
+}
+
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     app.exit(0);
@@ -185,6 +204,7 @@ pub fn run() {
             set_mode,
             set_autostart,
             quit_app,
+            save_image,
             local_ip,
             server_start,
             server_reply,

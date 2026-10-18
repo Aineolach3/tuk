@@ -2,7 +2,7 @@
 // тактическая куртка с нашивкой «Т» и рюкзак. Рта нет — настроение показывают глаза
 // и огонёк на кончике антенны. Рисуется в Canvas 2D, одинаково на Windows и Android.
 
-export type Mood = 'sleep' | 'idle' | 'listen' | 'think' | 'write' | 'happy' | 'angry' | 'alert' | 'meet';
+export type Mood = 'sleep' | 'idle' | 'listen' | 'think' | 'write' | 'happy' | 'angry' | 'alert' | 'meet' | 'wave' | 'poke' | 'dizzy' | 'dance' | 'eat';
 
 export const MOOD_LABEL: Record<Mood, string> = {
   sleep: 'Спит',
@@ -14,6 +14,11 @@ export const MOOD_LABEL: Record<Mood, string> = {
   angry: 'Злой',
   alert: 'Напоминает',
   meet: 'Встреча',
+  wave: 'Машет',
+  poke: 'Ой!',
+  dizzy: 'Голова кружится',
+  dance: 'Танцует',
+  eat: 'Глотает файл',
 };
 
 /** Цвет огонька антенны для каждого настроения. */
@@ -27,7 +32,58 @@ const LIGHT: Record<Mood, [number, number, number]> = {
   angry: [255, 60, 50],
   alert: [255, 150, 40],
   meet: [110, 230, 230],
+  wave: [255, 240, 210],
+  poke: [255, 120, 90],
+  dizzy: [200, 140, 255],
+  dance: [255, 90, 200],
+  eat: [140, 220, 255],
 };
+
+// ---------- Гардероб и цвета ----------
+
+export type Outfit = 'none' | 'scarf' | 'santa' | 'glasses' | 'headphones' | 'pumpkin' | 'flowers' | 'bowtie' | 'crown';
+
+export const OUTFIT_LABEL: Record<Outfit, string> = {
+  none: 'Без наряда',
+  scarf: 'Шарф',
+  santa: 'Новогодняя шапка',
+  glasses: 'Тёмные очки',
+  headphones: 'Наушники',
+  pumpkin: 'Тыква',
+  flowers: 'Венок',
+  bowtie: 'Бабочка',
+  crown: 'Корона',
+};
+
+/** Цвет капюшона и куртки. */
+export const HOOD_COLORS: Record<string, [number, number, number]> = {
+  'Чёрный': [22, 22, 27],
+  'Графит': [52, 54, 62],
+  'Тёмно-синий': [22, 32, 62],
+  'Хаки': [44, 50, 34],
+  'Бордо': [62, 20, 30],
+  'Белый': [225, 225, 232],
+};
+
+/** Цвет огонька в спокойном состоянии. */
+export const LIGHT_COLORS: Record<string, [number, number, number]> = {
+  'Тёплый': [255, 240, 210],
+  'Голубой': [110, 210, 255],
+  'Мятный': [120, 255, 190],
+  'Розовый': [255, 120, 200],
+  'Фиолетовый': [180, 130, 255],
+  'Янтарь': [255, 180, 60],
+};
+
+/** Наряд по времени года. */
+export function seasonalOutfit(d = new Date()): Outfit {
+  const m = d.getMonth() + 1, day = d.getDate();
+  if ((m === 12 && day >= 15) || (m === 1 && day <= 14)) return 'santa';
+  if ((m === 10 && day >= 25) || (m === 11 && day <= 1)) return 'pumpkin';
+  if (m >= 3 && m <= 5) return 'flowers';
+  if (m >= 6 && m <= 8) return 'glasses';
+  return 'scarf';
+}
 
 const INK = '#07070a';
 const rgb = (c: number[], a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
@@ -35,7 +91,7 @@ const mix = (a: number[], b: number[], t: number) => a.map((v, i) => v + (b[i] -
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
 interface Particle {
-  kind: 'z' | 'heart' | 'spark' | 'note';
+  kind: 'z' | 'heart' | 'spark' | 'note' | 'doc';
   x: number;
   y: number;
   vx: number;
@@ -62,10 +118,21 @@ export class Character {
   private visible = true;
   /** Сдвиг вниз в долях высоты: в свёрнутой строке видна голова. */
   peek = 0;
+  /** Наряд, цвет капюшона и цвет огонька в покое. */
+  outfit: Outfit = 'none';
+  hood: number[] = HOOD_COLORS['Чёрный'];
+  idleLight: number[] | null = null;
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(canvas: HTMLCanvasElement, opts: { still?: boolean } = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d')!;
+    if (opts.still) {
+      // картинка без анимации — для превью в гардеробе
+      this.resize();
+      this.nextWander = Infinity;
+      this.nextBlink = Infinity;
+      return;
+    }
     const ro = new ResizeObserver(() => this.resize());
     ro.observe(canvas);
     this.resize();
@@ -154,8 +221,23 @@ export class Character {
     if (m === 'angry') { cx += Math.sin(t * 45) * u * 0.03; }
     if (m === 'alert') cy -= Math.abs(Math.sin(t * 7)) * u * 0.08;
     if (m === 'meet') { cx += u * 0.35; rot = -0.06; }
+    if (m === 'wave') rot = Math.sin(t * 6) * 0.04;
+    if (m === 'poke') {
+      const k = Math.exp(-age * 5) * Math.abs(Math.cos(age * 18));
+      sy = 1 - 0.16 * k;
+      sx = 1 + 0.12 * k;
+    }
+    if (m === 'dizzy') { rot = Math.sin(t * 5) * 0.18; cx += Math.sin(t * 2.5) * u * 0.06; }
+    if (m === 'dance') {
+      const beat = Math.abs(Math.sin(t * Math.PI * 2.1));
+      cy -= beat * u * 0.12;
+      rot = Math.sin(t * Math.PI * 1.05) * 0.14;
+      sy = 1 - (1 - beat) * 0.05;
+    }
+    if (m === 'eat') sy = 1 + 0.1 * Math.sin(age * 14) * Math.exp(-age * 2);
 
-    this.light = mix(this.light, LIGHT[m], 0.12);
+    const target = m === 'idle' && this.idleLight ? this.idleLight : m === 'dance' ? [127 + 127 * Math.sin(t * 3), 127 + 127 * Math.sin(t * 3 + 2), 127 + 127 * Math.sin(t * 3 + 4)] : LIGHT[m];
+    this.light = mix(this.light, target, 0.12);
 
     // взгляд
     if (now > this.nextWander) {
@@ -167,6 +249,8 @@ export class Character {
     if (m === 'write') lt = { x: 0.2, y: 0.9 };
     if (m === 'listen' || m === 'alert') lt = { x: 0, y: 0 };
     if (m === 'meet') lt = { x: -1, y: 0.2 };
+    if (m === 'eat') lt = { x: 0, y: -0.9 };
+    if (m === 'poke') lt = { x: 0, y: 0 };
     this.look.x += (lt.x - this.look.x) * 0.12;
     this.look.y += (lt.y - this.look.y) * 0.12;
 
@@ -198,6 +282,8 @@ export class Character {
     this.drawAntenna(u, t);
     this.drawHood(u);
     this.drawFace(u, t, blinking);
+    this.drawOutfit(u, t);
+    if (m === 'wave') this.drawArms(u, t, true);
 
     ctx.restore();
 
@@ -209,8 +295,8 @@ export class Character {
 
   private fabric(y0: number, y1: number, light = 0.16): CanvasGradient {
     const g = this.ctx.createLinearGradient(0, y0, 0, y1);
-    g.addColorStop(0, `rgb(${46 * light * 6 | 0},${46 * light * 6 | 0},${54 * light * 6 | 0})`);
-    g.addColorStop(1, '#09090c');
+    g.addColorStop(0, rgb(mix(this.hood, [255, 255, 255], light * 0.9)));
+    g.addColorStop(1, rgb(mix(this.hood, [0, 0, 0], 0.65)));
     return g;
   }
 
@@ -279,12 +365,12 @@ export class Character {
     ctx.stroke();
   }
 
-  private drawArms(u: number, t: number) {
+  private drawArms(u: number, t: number, front = false) {
     const { ctx } = this;
     const m = this.mood;
-    const arm = (side: number, angle: number) => {
+    const arm = (side: number, angle: number, out = 0.5) => {
       ctx.save();
-      ctx.translate(side * u * 0.5, u * 0.42);
+      ctx.translate(side * u * out, u * 0.42);
       ctx.rotate(angle);
       ctx.fillStyle = this.fabric(-u * 0.1, u * 0.4, 0.15);
       ctx.beginPath();
@@ -305,6 +391,20 @@ export class Character {
     if (m === 'write') { l = -0.5; r = 0.5; }
     if (m === 'angry') { l = -0.3; r = 0.3; }
     if (m === 'alert') r = -2.2 + Math.sin(t * 9) * 0.3;
+    if (m === 'wave') {
+      // машущая рука рисуется поверх капюшона
+      if (front) arm(1, -2.6 + Math.sin(t * 12) * 0.35, 0.6);
+      else arm(-1, l);
+      return;
+    }
+    if (front) return;
+    if (m === 'dance') {
+      const ph = Math.sin(t * Math.PI * 1.05);
+      l = 1.2 + ph * 1.2;
+      r = -1.2 + ph * 1.2;
+    }
+    if (m === 'dizzy') { l = 0.9 + Math.sin(t * 4) * 0.3; r = -0.9 + Math.cos(t * 4) * 0.3; }
+    if (m === 'poke') { l = 0.7; r = -0.7; }
     arm(-1, l);
     arm(1, r);
   }
@@ -375,9 +475,9 @@ export class Character {
     const { ctx } = this;
     // купол капюшона
     const g = ctx.createRadialGradient(-u * 0.35, -u * 0.75, u * 0.1, 0, -u * 0.2, u * 1.15);
-    g.addColorStop(0, '#34343c');
-    g.addColorStop(0.55, '#16161b');
-    g.addColorStop(1, '#060608');
+    g.addColorStop(0, rgb(mix(this.hood, [255, 255, 255], 0.14)));
+    g.addColorStop(0.55, rgb(this.hood));
+    g.addColorStop(1, rgb(mix(this.hood, [0, 0, 0], 0.7)));
     ctx.fillStyle = g;
     ctx.beginPath();
     ctx.moveTo(0, -u * 1.05);
@@ -409,7 +509,7 @@ export class Character {
     // нашивка на капюшоне
     this.patch(-u * 0.12, -u * 0.86, u * 0.24, u * 0.17);
     // край капюшона вокруг лица
-    ctx.fillStyle = '#0a0a0d';
+    ctx.fillStyle = rgb(mix(this.hood, [0, 0, 0], 0.55));
     ctx.beginPath();
     ctx.ellipse(0, -u * 0.06, u * 0.78, u * 0.6, 0, 0, Math.PI * 2);
     ctx.fill();
@@ -451,7 +551,20 @@ export class Character {
 
     for (const s of [-1, 1]) {
       const x = s * ex + lx, y = ey + ly;
-      if (m === 'happy') {
+      if (m === 'dizzy') {
+        // спирали вместо глаз
+        ctx.lineWidth = u * 0.035;
+        ctx.beginPath();
+        for (let a = 0; a < Math.PI * 5; a += 0.25) {
+          const rr = u * 0.012 * a;
+          const px = x + Math.cos(a + t * 6 * s) * rr, py = y + Math.sin(a + t * 6 * s) * rr;
+          if (a === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+        continue;
+      }
+      if (m === 'happy' || m === 'dance' || (m === 'eat' && (performance.now() - this.since) > 450)) {
         ctx.lineWidth = u * 0.075;
         ctx.beginPath();
         ctx.arc(x, y + u * 0.08, u * 0.12, Math.PI * 1.15, Math.PI * 1.85);
@@ -472,6 +585,12 @@ export class Character {
       let ryy = ry;
       if (m === 'think' && s > 0) ryy *= 0.85;
       ctx.save();
+      if (m === 'poke') {
+        // недовольный прищур: верх глаз срезан ровно
+        ctx.beginPath();
+        ctx.rect(x - rx * 2, y - ryy * 0.15, rx * 4, ryy * 3);
+        ctx.clip();
+      }
       if (m === 'angry') {
         // злой прищур: верх глаза срезан наклонной линией
         ctx.beginPath();
@@ -494,6 +613,152 @@ export class Character {
       ctx.fillStyle = INK;
     }
     void t;
+  }
+
+  // ---------- Наряды ----------
+
+  private drawOutfit(u: number, t: number) {
+    const { ctx } = this;
+    const o = this.outfit;
+    if (o === 'none') return;
+    ctx.save();
+    if (o === 'scarf' || o === 'santa') {
+      // вязаный шарф на шее
+      const red = o === 'santa' ? '#c8242f' : '#b8432f';
+      ctx.fillStyle = red;
+      ctx.beginPath();
+      ctx.roundRect(-u * 0.56, u * 0.3, u * 1.12, u * 0.2, u * 0.1);
+      ctx.fill();
+      ctx.save();
+      ctx.translate(u * 0.28, u * 0.42);
+      ctx.rotate(0.12 + Math.sin(t * 2) * 0.05);
+      ctx.beginPath();
+      ctx.roundRect(-u * 0.1, 0, u * 0.2, u * 0.42, u * 0.05);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      for (let i = 0; i < 2; i++) ctx.fillRect(-u * 0.1, u * (0.14 + i * 0.12), u * 0.2, u * 0.035);
+      ctx.restore();
+      ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+      ctx.lineWidth = u * 0.015;
+      for (let x = -0.48; x < 0.5; x += 0.08) {
+        ctx.beginPath();
+        ctx.moveTo(u * x, u * 0.32);
+        ctx.lineTo(u * (x + 0.03), u * 0.48);
+        ctx.stroke();
+      }
+    }
+    if (o === 'santa') {
+      // красная шапка поверх капюшона
+      ctx.fillStyle = '#d0262f';
+      ctx.beginPath();
+      ctx.moveTo(-u * 0.72, -u * 0.72);
+      ctx.quadraticCurveTo(-u * 0.2, -u * 1.55, u * 0.62, -u * 1.25);
+      ctx.quadraticCurveTo(u * 0.35, -u * 1.0, u * 0.72, -u * 0.72);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#f4f4f6';
+      ctx.beginPath();
+      ctx.roundRect(-u * 0.8, -u * 0.82, u * 1.6, u * 0.2, u * 0.1);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(u * 0.66, -u * 1.24, u * 0.13, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (o === 'glasses') {
+      ctx.fillStyle = '#050507';
+      for (const sd of [-1, 1]) {
+        ctx.beginPath();
+        ctx.roundRect(sd * u * 0.24 - u * 0.2, -u * 0.2, u * 0.4, u * 0.26, u * 0.1);
+        ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.35)';
+        ctx.beginPath();
+        ctx.ellipse(sd * u * 0.24 - u * 0.07, -u * 0.12, u * 0.06, u * 0.025, -0.4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#050507';
+      }
+      ctx.fillRect(-u * 0.06, -u * 0.13, u * 0.12, u * 0.04);
+    }
+    if (o === 'headphones') {
+      ctx.strokeStyle = '#2b2b33';
+      ctx.lineWidth = u * 0.09;
+      ctx.beginPath();
+      ctx.arc(0, -u * 0.2, u * 0.95, Math.PI * 1.08, Math.PI * 1.92);
+      ctx.stroke();
+      for (const sd of [-1, 1]) {
+        ctx.fillStyle = '#1f1f26';
+        ctx.beginPath();
+        ctx.roundRect(sd * u * 0.95 - u * 0.15, -u * 0.32, u * 0.3, u * 0.42, u * 0.12);
+        ctx.fill();
+        ctx.fillStyle = rgb(this.light, 0.8);
+        ctx.beginPath();
+        ctx.arc(sd * u * 0.95, -u * 0.11, u * 0.05, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    if (o === 'pumpkin') {
+      const y = u * 0.62;
+      ctx.fillStyle = '#ef7d1a';
+      for (const dx of [-0.13, 0, 0.13]) {
+        ctx.beginPath();
+        ctx.ellipse(u * dx, y, u * 0.16, u * 0.17, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = '#3d7a2a';
+      ctx.fillRect(-u * 0.025, y - u * 0.25, u * 0.05, u * 0.09);
+      const glow = 0.6 + 0.4 * Math.sin(t * 4);
+      ctx.fillStyle = `rgba(255,220,90,${glow})`;
+      ctx.beginPath();
+      ctx.moveTo(-u * 0.13, y - u * 0.04); ctx.lineTo(-u * 0.06, y - u * 0.04); ctx.lineTo(-u * 0.095, y - u * 0.1); ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(u * 0.06, y - u * 0.04); ctx.lineTo(u * 0.13, y - u * 0.04); ctx.lineTo(u * 0.095, y - u * 0.1); ctx.fill();
+      ctx.fillRect(-u * 0.1, y + u * 0.04, u * 0.2, u * 0.035);
+    }
+    if (o === 'flowers') {
+      const cols = ['#ff8fb8', '#ffd84d', '#9be37a', '#8fc8ff', '#ff9f6b'];
+      for (let i = 0; i < 7; i++) {
+        const a = Math.PI * (1.15 + i * 0.7 / 6);
+        const x = Math.cos(a) * u * 0.92, y = -u * 0.2 + Math.sin(a) * u * 0.86;
+        ctx.fillStyle = cols[i % cols.length];
+        for (let k = 0; k < 5; k++) {
+          const b = (k / 5) * Math.PI * 2 + t * 0.5;
+          ctx.beginPath();
+          ctx.arc(x + Math.cos(b) * u * 0.055, y + Math.sin(b) * u * 0.055, u * 0.045, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.fillStyle = '#fff3b0';
+        ctx.beginPath();
+        ctx.arc(x, y, u * 0.035, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    if (o === 'bowtie') {
+      ctx.fillStyle = '#c8242f';
+      ctx.beginPath();
+      ctx.moveTo(0, u * 0.38); ctx.lineTo(-u * 0.2, u * 0.28); ctx.lineTo(-u * 0.2, u * 0.48); ctx.closePath();
+      ctx.moveTo(0, u * 0.38); ctx.lineTo(u * 0.2, u * 0.28); ctx.lineTo(u * 0.2, u * 0.48); ctx.closePath();
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(0, u * 0.38, u * 0.05, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (o === 'crown') {
+      ctx.fillStyle = '#f2c230';
+      ctx.beginPath();
+      ctx.moveTo(-u * 0.32, -u * 0.98);
+      ctx.lineTo(-u * 0.32, -u * 1.22);
+      ctx.lineTo(-u * 0.16, -u * 1.1);
+      ctx.lineTo(0, -u * 1.3);
+      ctx.lineTo(u * 0.16, -u * 1.1);
+      ctx.lineTo(u * 0.32, -u * 1.22);
+      ctx.lineTo(u * 0.32, -u * 0.98);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#e8394a';
+      ctx.beginPath();
+      ctx.arc(0, -u * 1.06, u * 0.04, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
   }
 
   private drawFriend(W: number, H: number, u: number, t: number, age: number) {
@@ -528,11 +793,12 @@ export class Character {
   private updateParticles(now: number, cx: number, cy: number, u: number) {
     const { ctx } = this;
     const m = this.mood;
-    const every = m === 'sleep' ? 1400 : m === 'happy' ? 500 : m === 'angry' ? 260 : 0;
+    const every = m === 'sleep' ? 1400 : m === 'happy' ? 500 : m === 'angry' ? 260 : m === 'dance' ? 420 : 0;
     if (every && now - this.lastSpawn > every) {
       this.lastSpawn = now;
       if (m === 'sleep') this.spawn({ kind: 'z', x: cx + u * 0.55, y: cy - u * 1.1, vx: u * 0.15, vy: -u * 0.35, life: 2.6 });
       if (m === 'happy') this.spawn({ kind: 'heart', x: cx + (Math.random() - 0.5) * u * 1.4, y: cy - u * 1.0, vx: (Math.random() - 0.5) * u * 0.3, vy: -u * 0.55, life: 1.4 });
+      if (m === 'dance') this.spawn({ kind: 'note', x: cx + (Math.random() - 0.5) * u * 1.6, y: cy - u * 0.9, vx: (Math.random() - 0.5) * u * 0.3, vy: -u * 0.5, life: 1.6, color: rgb(this.light) });
       if (m === 'angry')
         this.spawn({ kind: 'spark', x: cx + u * 0.4, y: cy - u * 1.42, vx: (Math.random() - 0.5) * u * 1.2, vy: -u * (0.4 + Math.random() * 0.6), life: 0.6, color: rgb(LIGHT.angry) });
     }
@@ -557,6 +823,10 @@ export class Character {
         ctx.bezierCurveTo(-r * 1.6, -r * 0.3, -r * 0.6, -r * 1.4, 0, -r * 0.4);
         ctx.bezierCurveTo(r * 0.6, -r * 1.4, r * 1.6, -r * 0.3, 0, r * 0.8);
         ctx.fill();
+      } else if (p.kind === 'note') {
+        ctx.fillStyle = p.color ?? '#fff';
+        ctx.font = `700 ${u * 0.36}px system-ui, sans-serif`;
+        ctx.fillText(Math.floor(p.born) % 2 ? '♪' : '♫', x, y);
       } else if (p.kind === 'spark') {
         ctx.fillStyle = p.color ?? '#fff';
         ctx.beginPath();
@@ -566,6 +836,31 @@ export class Character {
       ctx.restore();
     }
 
+    if (m === 'dizzy') {
+      for (let i = 0; i < 3; i++) {
+        const a = now / 400 + (i * Math.PI * 2) / 3;
+        ctx.fillStyle = '#ffe36b';
+        ctx.font = `700 ${u * 0.28}px system-ui, sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText('★', cx + Math.cos(a) * u * 0.7, cy - u * 1.15 + Math.sin(a) * u * 0.15);
+        ctx.textAlign = 'start';
+      }
+    }
+    if (m === 'eat') {
+      // файл влетает в капюшон
+      const k = clamp((now - this.since) / 600, 0, 1);
+      if (k < 1) {
+        ctx.save();
+        ctx.translate(cx + u * 1.2 * (1 - k), cy - u * 1.3 * (1 - k) - u * 0.1);
+        ctx.rotate((1 - k) * 0.8);
+        ctx.scale(1 - k * 0.7, 1 - k * 0.7);
+        ctx.fillStyle = '#f3f3f6';
+        ctx.fillRect(-u * 0.2, -u * 0.26, u * 0.4, u * 0.52);
+        ctx.fillStyle = '#9aa0ad';
+        for (let i = 0; i < 4; i++) ctx.fillRect(-u * 0.13, -u * 0.15 + i * u * 0.09, u * 0.26, u * 0.03);
+        ctx.restore();
+      }
+    }
     if (m === 'think') {
       for (let i = 0; i < 3; i++) {
         const ph = (now / 1000) * 4 - i * 0.6;

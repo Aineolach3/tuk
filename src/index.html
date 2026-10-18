@@ -18,7 +18,10 @@
     </header>
     <main id="panel">
       <div id="reply" role="status" aria-live="polite"></div>
+      <div id="file-chip" hidden></div>
       <form id="input-form" autocomplete="off">
+        <button type="button" id="attach" aria-label="Прикрепить файл">📎</button>
+        <input type="file" id="file-input" hidden accept=".txt,.md,.csv,.json,.log,.pdf,.html,.xml,.yaml,.yml,.ini,.srt,text/*,application/pdf">
         <input id="input" enterkeyhint="send" placeholder="Что записать или о чём напомнить?" aria-label="Команда">
         <button type="submit" aria-label="Отправить">↑</button>
       </form>
@@ -34,6 +37,7 @@
       <footer><span id="link-status" class="link-status off"></span></footer>
     </main>
   </div>
+  <div id="overlay" hidden></div>
   <script type="module" src="app.js"></script>
 </body>
 </html>

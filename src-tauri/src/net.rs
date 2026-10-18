@@ -265,6 +265,39 @@ pub fn discover_on(port: u16, ms: u64) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Декодирование base64 (стандартный алфавит, с «=» или без).
+pub fn b64decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let clean: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=').collect();
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    for chunk in clean.chunks(4) {
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= val(c)? << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+        if chunk.len() == 1 {
+            return None;
+        }
+    }
+    Some(out)
+}
+
 /// Строка в JSON (без serde).
 pub fn json_str(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
@@ -341,6 +374,14 @@ mod tests {
         s.send_to(b"garbage", ("127.0.0.1", port)).unwrap();
         let found = h.join().unwrap();
         assert_eq!(found, vec!["127.0.0.1|TUK1|abc|47800|PC".to_string()]);
+    }
+
+    #[test]
+    fn base64() {
+        assert_eq!(b64decode("SGVsbG8=").unwrap(), b"Hello");
+        assert_eq!(b64decode("SGVsbG8").unwrap(), b"Hello");
+        assert_eq!(b64decode("0J/RgNC40LLQtdGC").unwrap(), "Привет".as_bytes());
+        assert!(b64decode("@@@").is_none());
     }
 
     #[test]
