@@ -5,8 +5,8 @@
   --line: #2e2a3b;
   --text: #f3eef8;
   --muted: #9d96ab;
-  --accent: #ffb27a;
-  --accent-ink: #2a1a0f;
+  --accent: #f4c470;
+  --accent-ink: #1c1406;
   --green: #6cc46a;
   --warn: #ff6b5b;
   --radius: 14px;
@@ -64,7 +64,7 @@ html.android #bar, html.web #bar {
   margin: 8px auto 4px;
   width: min(92vw, 440px);
   height: 64px;
-  background: #000;
+  background: #19181f;
   border-radius: 32px;
   padding: 4px 10px 4px 4px;
   box-shadow: 0 6px 24px rgba(0,0,0,0.45);
