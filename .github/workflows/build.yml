@@ -110,9 +110,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ls -la out
-          for f in out/*.apk; do [ -e "$f" ] && mv "$f" out/Tuk-android.apk; done
+          find out -type f | sed 's/^/  /'
+          mkdir -p files
+          APK=$(find out -name '*.apk' | head -n 1)
+          if [ -n "$APK" ]; then cp "$APK" files/Tuk-android.apk; fi
+          find out -name '*.exe' -exec cp {} files/ \;
+          ls -la files
           TAG="build-${{ github.run_number }}"
           NOTES="Сборка №${{ github.run_number }}. Android: ${{ needs.android.result }}, Windows: ${{ needs.windows.result }}.
           На телефоне скачайте Tuk-android.apk, на ПК — файл *setup.exe."
-          gh release create "$TAG" out/* --repo "${{ github.repository }}" --title "Тук, сборка ${{ github.run_number }}" --notes "$NOTES" --latest
+          gh release create "$TAG" files/* --repo "${{ github.repository }}" --title "Тук, сборка ${{ github.run_number }}" --notes "$NOTES" --latest
