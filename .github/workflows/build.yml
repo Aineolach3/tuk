@@ -51,6 +51,44 @@ jobs:
       - name: Тесты
         run: npm test
 
+      # мозг (llama.cpp) собирается под телефон отдельно; голос (sherpa-onnx) — готовые библиотеки
+      - name: Кэш нативного мозга
+        id: llmcache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/tukllm
+          key: tukllm-b8999-${{ hashFiles('src-tauri/tauri-plugin-tuk/native/**') }}
+
+      - name: Мозг для Android (llama.cpp)
+        if: steps.llmcache.outputs.cache-hit != 'true'
+        run: |
+          export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
+          git clone -q --depth 1 --branch b8999 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+          set -o pipefail
+          cmake -S src-tauri/tauri-plugin-tuk/native -B /tmp/llm-build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/tmp/llama.cpp \
+            -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 2>&1 | tail -20
+          if ! cmake --build /tmp/llm-build -j4 --target tukllm 2>&1 | tee llm.log | grep -E "error|Built target"; then
+            grep -E -B2 -A6 "error" llm.log | head -60 | sed ':a;N;$!ba;s/%/%25/g;s/\n/%0A/g' | sed 's/^/::error title=llama.cpp::/'
+            exit 1
+          fi
+          mkdir -p /tmp/tukllm
+          cp /tmp/llm-build/libtukllm.so /tmp/tukllm/
+          "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" /tmp/tukllm/libtukllm.so
+          ls -la /tmp/tukllm
+
+      - name: Голос для Android (sherpa-onnx)
+        run: |
+          J=src-tauri/tauri-plugin-tuk/android/src/main/jniLibs/arm64-v8a
+          mkdir -p "$J"
+          cp /tmp/tukllm/libtukllm.so "$J/"
+          curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-v1.13.8-android.tar.bz2 -o /tmp/sherpa.tar.bz2
+          tar -xjf /tmp/sherpa.tar.bz2 -C /tmp ./jniLibs/arm64-v8a
+          cp /tmp/jniLibs/arm64-v8a/libsherpa-onnx-jni.so /tmp/jniLibs/arm64-v8a/libonnxruntime.so "$J/"
+          ls -la "$J"
+
       - name: Сборка APK
         run: |
           export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"

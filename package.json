@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p . && node scripts/copy-static.mjs",
-    "test": "tsx --test tests/parser.test.ts tests/sync.test.ts tests/agents.test.ts",
+    "test": "tsx --test tests/parser.test.ts tests/sync.test.ts tests/agents.test.ts tests/actions.test.ts",
     "tauri": "tauri"
   },
   "devDependencies": {

@@ -40,6 +40,7 @@ export interface Settings {
   dance?: boolean; // танцевать под музыку
   island?: boolean; // Android: Тук над приложениями
   wake?: boolean; // Android: слушать «Тук Тук»
+  voicePreset?: string; // живой голос: tuk | bright | boy | calm | '' (системный)
   voiceLoop?: boolean; // продолжать разговор голосом после ответа
 }
 
@@ -54,6 +55,7 @@ export interface Data {
   settings: Settings;
   chat?: ChatMsg[]; // история разговора (только на этом устройстве)
   recapSeen?: string; // неделя, сводку за которую уже показали
+  webCacheCleared?: boolean; // Android: старый мозг из WebView удалён
   islandLook?: string; // для какого наряда уже отправлены кадры острова
   agentRules?: import('./agents.js').Rule[]; // «разрешать всегда»
 }

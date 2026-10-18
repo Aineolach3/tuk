@@ -14,6 +14,9 @@ import { Link, ago } from './link.js';
 import { qrSvg } from './qr.js';
 import * as R from './reminders.js';
 import { randomKey } from './crypto.js';
+import { matchApp, matchContacts, parseAction, pcTarget, wordsToDigits, type Action, type Contact } from './actions.js';
+
+const VOICE_SAMPLE = 'Привет! Я Тук. Теперь я говорю вот так. Нравится?';
 
 /** Кадры острова: настроение, число кадров, кадров в секунду. */
 const ISLAND_MOODS: [Mood, number, number][] = [
@@ -85,7 +88,7 @@ class App {
     const st = data.settings;
     st.model ??= P.kind === 'desktop' ? 'smart' : 'lite';
     st.usePcBrain ??= true;
-    this.brain = new Brain(st.model);
+    this.brain = new Brain(st.model, undefined, P.kind === 'android' ? P.llm : undefined);
     this.brain.onState = (b) => this.onBrainState(b);
     st.volume ??= 0.5;
     st.dance ??= true;
@@ -167,6 +170,14 @@ class App {
         }
       });
       void this.startIsland();
+      void this.refreshVoice();
+      if (!this.store.data.webCacheCleared) {
+        // старый мозг лежал внутри WebView и съедал место — теперь он нативный
+        void P.clearWebModelCache().then(() => {
+          this.store.data.webCacheCleared = true;
+          this.store.changed('settings');
+        });
+      }
     }
     await R.syncAndroidSchedule(this.store);
     await P.askNotifyPermission().catch(() => {});
@@ -297,6 +308,13 @@ class App {
 
   async handleInput(text: string): Promise<void> {
     this.activity();
+    // ответ на «Кому именно?»
+    if (this.pendingPick && (await this.resolvePick(text))) return;
+    // команда-действие: будильник, звонок, открыть приложение…
+    const action = parseAction(text);
+    if (action) return this.runAction(action);
+    // голосом числа приходят словами: «через пять минут» → «через 5 минут»
+    if (this.voiceAsked) text = wordsToDigits(text).replace(/^./, (c) => c.toUpperCase());
     const p = parse(text);
     if (p.type === 'empty') return;
     const question = /\?\s*$/.test(text.trim());
@@ -1142,7 +1160,7 @@ class App {
     if (!clean) return;
     this.setVoice('speaking');
     try {
-      await P.speak(clean);
+      await P.speak(clean, this.voicePreset());
     } catch (e) {
       console.warn('синтез речи:', e);
     }
@@ -1152,6 +1170,280 @@ class App {
       this.voiceContinue = false;
       setTimeout(() => void this.voiceTurn(), 250);
     }
+  }
+
+  // ---------------- Действия ----------------
+
+  contactsCache: Contact[] | null = null;
+  appsCache: { label: string; pkg: string }[] | null = null;
+  /** Ждём уточнения: «Кому именно?» */
+  pendingPick: { kind: 'call' | 'sms'; options: Contact[]; text?: string } | null = null;
+
+  /** Разрешение на телефоне: спросить и подождать ответа человека (до 25 с). */
+  async ensurePerm(which: 'contacts' | 'call', why: string): Promise<boolean> {
+    const has = async () => !!(await P.act('perm', { which }).catch(() => null))?.granted;
+    if (await has()) return true;
+    this.say(why, 'think', 6000);
+    await P.act('ask', { which }).catch(() => {});
+    for (let i = 0; i < 50; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (await has()) return true;
+    }
+    return false;
+  }
+
+  async contacts(): Promise<Contact[] | null> {
+    if (this.contactsCache) return this.contactsCache;
+    if (!(await this.ensurePerm('contacts', 'Чтобы звонить и писать людям из ваших контактов, разрешите мне доступ к контактам.'))) {
+      this.say('Без доступа к контактам не могу найти человека. Можно назвать номер: «позвони на 8 900 …».', 'think', 6000);
+      return null;
+    }
+    const r = await P.act('contacts');
+    this.contactsCache = (r?.list ?? []) as Contact[];
+    setTimeout(() => (this.contactsCache = null), 10 * 60_000); // контакты могли измениться
+    return this.contactsCache;
+  }
+
+  /** Найти одного человека; если подходят несколько — спросить. */
+  async pickContact(who: string, kind: 'call' | 'sms', text?: string): Promise<{ c: Contact; phone: string } | null> {
+    const book = await this.contacts();
+    if (!book) return null;
+    const found = matchContacts(who, book);
+    if (!found.length) {
+      this.say(`Не нашёл «${who}» в контактах.`, 'think', 4000);
+      return null;
+    }
+    const close = found.filter((f) => f.score >= found[0].score - 0.04);
+    if (close.length > 1) {
+      this.pendingPick = { kind, options: close.slice(0, 4).map((f) => f.contact), text };
+      const names = close.slice(0, 4).map((f, i) => `${i + 1}) ${f.contact.name}`).join(', ');
+      this.say(`Кому именно? ${names}`, 'think', 15000);
+      return null;
+    }
+    return { c: found[0].contact, phone: found[0].contact.phones[0] };
+  }
+
+  /** Ответ на «Кому именно?»: имя, «первому», «второй»… */
+  async resolvePick(text: string): Promise<boolean> {
+    const p = this.pendingPick;
+    if (!p) return false;
+    this.pendingPick = null;
+    const ord = ['перв', 'втор', 'трет', 'четв'].findIndex((s) => new RegExp(s, 'i').test(text));
+    const num = /^\s*(\d)\s*$/.exec(text);
+    let c: Contact | undefined;
+    if (num) c = p.options[+num[1] - 1];
+    else if (ord >= 0) c = p.options[ord];
+    else c = matchContacts(text, p.options)[0]?.contact;
+    if (!c) return false;
+    await this.doContact(p.kind, c, c.phones[0], p.text);
+    return true;
+  }
+
+  async doContact(kind: 'call' | 'sms', c: Contact, phone: string, text?: string): Promise<void> {
+    if (kind === 'call') {
+      this.say(`Звоню: ${c.name}.`, 'carry', 2500);
+      await new Promise((r) => setTimeout(r, this.voiceAsked ? 1200 : 300));
+      const r = await P.act('call', { number: phone });
+      if (!r?.direct) {
+        this.say('Открыл набор номера — нажмите вызов. Чтобы я звонил сам, разрешите «Телефон».', 'ready', 6000);
+        void P.act('ask', { which: 'call' });
+      }
+    } else {
+      await P.act('sms', { number: phone, text: text ?? '' });
+      this.say(`Сообщение для ${c.name} готово — проверьте и отправьте.`, 'carry', 4000);
+    }
+  }
+
+  /** Выполнить команду-действие. */
+  async runAction(a: Action): Promise<void> {
+    this.activity();
+    this.flash('carry', 1500);
+    const android = P.kind === 'android';
+    const hhmm = (h: number, m: number) => `${h}:${String(m).padStart(2, '0')}`;
+    const nextAt = (h: number, m: number) => {
+      const d = new Date();
+      d.setHours(h, m, 0, 0);
+      if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
+      return d.getTime();
+    };
+    try {
+      switch (a.kind) {
+        case 'time':
+          return this.say(`Сейчас ${fmtTime(Date.now())}.`, 'ready', 3500);
+        case 'date':
+          return this.say(`Сегодня ${new Date().toLocaleDateString('ru-RU', { weekday: 'long', day: 'numeric', month: 'long' })}.`, 'ready', 3500);
+        case 'alarm': {
+          const when = hhmm(a.hour, a.minute);
+          const days = a.days?.length === 5 ? ' по будням' : a.days?.length === 7 ? ' каждый день' : a.days?.length === 2 ? ' по выходным' : '';
+          if (android) {
+            await P.act('alarm', { hour: a.hour, minute: a.minute, days: a.days, label: a.label ?? this.store.data.settings.name });
+            return this.say(`Будильник на ${when}${days} поставил.`, 'happy', 3500);
+          }
+          this.store.add({ kind: 'reminder', text: 'Будильник ⏰', dueAt: nextAt(a.hour, a.minute), repeat: a.days?.length === 5 ? 'weekdays' : a.days?.length === 7 ? 'daily' : undefined });
+          return this.say(`Разбужу в ${when}${days} — звонком в строке и уведомлением.`, 'happy', 4000);
+        }
+        case 'timer': {
+          const s = a.seconds;
+          const txt = s >= 3600 ? `${Math.floor(s / 3600)} ч${s % 3600 ? ` ${Math.round((s % 3600) / 60)} мин` : ''}` : s >= 60 ? `${Math.round(s / 60)} мин` : `${s} с`;
+          if (android) await P.act('timer', { seconds: s, label: this.store.data.settings.name });
+          else this.store.add({ kind: 'reminder', text: `Таймер ${txt} ⏱`, dueAt: Date.now() + s * 1000 });
+          return this.say(`Таймер на ${txt} пошёл.`, 'happy', 3000);
+        }
+        case 'call':
+        case 'sms': {
+          if (!android) return this.say('Звонить и писать сообщения я умею на телефоне — скажите это там.', 'think', 4500);
+          if (a.number) {
+            if (a.kind === 'call') {
+              this.say(`Звоню на ${a.number}.`, 'carry', 2500);
+              const r = await P.act('call', { number: a.number });
+              if (!r?.direct) this.say('Открыл набор номера — нажмите вызов.', 'ready', 4000);
+            } else await P.act('sms', { number: a.number, text: a.text });
+            return;
+          }
+          const hit = await this.pickContact(a.who ?? '', a.kind, a.kind === 'sms' ? a.text : undefined);
+          if (hit) await this.doContact(a.kind, hit.c, hit.phone, a.kind === 'sms' ? a.text : undefined);
+          return;
+        }
+        case 'open': {
+          if (!android) {
+            const t = pcTarget(a.app);
+            if (!t) return this.say(`Не знаю, как открыть «${a.app}» на этом компьютере.`, 'think', 4000);
+            await P.openTarget(t);
+            return this.say(`Открываю: ${a.app}.`, 'carry', 2500);
+          }
+          this.appsCache ??= ((await P.act('apps'))?.list ?? []) as { label: string; pkg: string }[];
+          const app = matchApp(a.app, this.appsCache);
+          if (!app) {
+            const site = pcTarget(a.app);
+            if (site?.startsWith('http')) {
+              await P.act('url', { url: site });
+              return this.say(`Открываю ${a.app}.`, 'carry', 2500);
+            }
+            return this.say(`Не нашёл приложение «${a.app}».`, 'think', 4000);
+          }
+          await P.act('open', { pkg: app.pkg });
+          return this.say(`Открываю ${app.label}.`, 'carry', 2500);
+        }
+        case 'torch':
+          if (!android) return this.say('Фонарик есть только на телефоне 🙂', 'happy', 3000);
+          await P.act('torch', { on: a.on });
+          return this.say(a.on ? 'Фонарик включил.' : 'Фонарик выключил.', 'ready', 2500);
+        case 'volume': {
+          if (!android) return this.say('Громкость на ПК пока регулируйте клавишами — скоро научусь.', 'think', 4000);
+          const r = await P.act('volume', { dir: a.dir });
+          return this.say(a.dir === 'mute' ? 'Звук выключил.' : `Громкость ${r?.level ?? ''}%.`, 'ready', 2500);
+        }
+        case 'media':
+          if (android) await P.act('media', { key: a.key });
+          else await P.mediaControl(a.key === 'next' ? 'next' : a.key === 'prev' ? 'prev' : 'toggle');
+          return this.say(a.key === 'next' ? 'Следующий трек.' : a.key === 'prev' ? 'Предыдущий трек.' : a.key === 'pause' ? 'Пауза.' : 'Играю.', 'dance', 2000);
+        case 'navigate':
+          if (android) await P.act('navigate', { place: a.place });
+          else await P.openTarget('https://yandex.ru/maps/?text=' + encodeURIComponent(a.place));
+          return this.say(`Строю маршрут: ${a.place}.`, 'search', 3000);
+        case 'search':
+          if (android) await P.act('search', { query: a.query });
+          else await P.openTarget('https://yandex.ru/search/?text=' + encodeURIComponent(a.query));
+          return this.say(`Ищу: ${a.query}.`, 'search', 3000);
+        case 'battery': {
+          if (!android) {
+            const b = await (navigator as any).getBattery?.().catch(() => null);
+            if (!b) return this.say('На этом компьютере не вижу батарею.', 'think', 3000);
+            return this.say(`Заряд ${Math.round(b.level * 100)}%${b.charging ? ', заряжается' : ''}.`, 'ready', 3500);
+          }
+          const r = await P.act('battery');
+          return this.say(`Заряд ${r.level}%${r.charging ? ', заряжается' : ''}.`, r.level < 20 ? 'alert' : 'ready', 3500);
+        }
+        case 'calendar':
+          if (android) {
+            await P.act('calendar', { title: a.title, begin: a.at, end: a.at + 3_600_000 });
+            return this.say(`Открыл календарь: «${a.title}», ${fmtWhen(a.at)}. Проверьте и сохраните.`, 'write', 4500);
+          }
+          this.store.add({ kind: 'reminder', text: a.title, dueAt: a.at });
+          return this.say(`Записал: «${a.title}», ${fmtWhen(a.at)}.`, 'write', 3500);
+        case 'camera':
+          if (!android) return void (await P.openTarget('microsoft.windows.camera:'));
+          await P.act('camera');
+          return this.say('Открываю камеру.', 'carry', 2000);
+        case 'settings':
+          if (!android) return void (await P.openTarget('ms-settings:'));
+          await P.act('settings', { which: a.which });
+          return this.say('Открыл настройки.', 'carry', 2000);
+      }
+    } catch (e) {
+      this.sfx('error');
+      this.say('Не получилось: ' + String((e as Error).message ?? e), 'think', 5000);
+    }
+  }
+
+  // ---------------- Живой голос ----------------
+
+  voiceState: { state: string; progress?: number; error?: string } | null = null;
+  voiceTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** Какой голос использовать: '' — системный. */
+  voicePreset(): string {
+    const v = this.store.data.settings.voicePreset;
+    return v === undefined ? 'tuk' : v;
+  }
+
+  async refreshVoice(): Promise<void> {
+    if (P.kind !== 'android') return;
+    this.voiceState = await P.voice('status', this.voicePreset() || 'tuk').catch(() => null);
+  }
+
+  async chooseVoice(preset: string): Promise<void> {
+    this.store.data.settings.voicePreset = preset;
+    this.store.changed('settings');
+    await this.refreshVoice();
+    if (preset && this.voiceState?.state !== 'ready') {
+      await P.voice('download', preset);
+      this.say('Скачиваю голос (около 67 МБ) — один раз, дальше он работает без интернета.', 'carry', 5000);
+      this.watchVoice();
+    } else if (preset) void this.speakOut(VOICE_SAMPLE);
+    else void this.speakOut('Теперь говорю системным голосом.');
+    this.lastHtml = '';
+    this.render();
+  }
+
+  watchVoice(): void {
+    if (this.voiceTimer) return;
+    this.voiceTimer = setInterval(async () => {
+      await this.refreshVoice();
+      if (this.tab === 'settings') {
+        this.lastHtml = '';
+        this.render();
+      }
+      const st = this.voiceState?.state;
+      if (st === 'ready' || st === 'error' || st === 'none') {
+        clearInterval(this.voiceTimer!);
+        this.voiceTimer = null;
+        if (st === 'ready') void this.speakOut(VOICE_SAMPLE);
+        else if (st === 'error') this.say('Не получилось скачать голос: ' + (this.voiceState?.error ?? 'нет интернета?'), 'think', 6000);
+      }
+    }, 1000);
+  }
+
+  voiceHtml(): string {
+    if (P.kind !== 'android') return '';
+    const cur = this.voicePreset();
+    const st = this.voiceState;
+    const opts: [string, string, string][] = [
+      ['tuk', 'Тук', 'живой, чуть мальчишеский — по умолчанию'],
+      ['bright', 'Звонкий', 'светлый и мягкий'],
+      ['boy', 'Мальчишка', 'бодрый, озорной'],
+      ['calm', 'Спокойный', 'взрослый, без изменений'],
+      ['', 'Системный', 'голос телефона, без скачивания'],
+    ];
+    let h = '<h3>Голос Тука</h3><div class="voices">';
+    for (const [id, name, about] of opts)
+      h += `<button class="voice-opt ${cur === id ? 'on' : ''}" data-act="set-voice" data-id="${id}"><b>${name}</b><span>${about}</span></button>`;
+    h += '</div>';
+    if (st?.state === 'downloading') h += `<div class="progress"><i style="width:${st.progress ?? 0}%"></i></div><p class="muted small">Скачиваю голос… ${st.progress ?? 0}%</p>`;
+    else if (cur && st?.state !== 'ready') h += `<p class="muted small">Голос ещё не скачан — нажмите на него, чтобы скачать (около 67 МБ, один раз).</p>`;
+    h += `<div class="row"><button class="pill ghost small" data-act="voice-test">Послушать</button></div>`;
+    h += '<p class="muted small">Нейросетевой голос работает прямо на телефоне, без интернета.</p>';
+    return h;
   }
 
   // ---------------- События ----------------
@@ -1405,6 +1697,10 @@ class App {
         return this.toggleIsland(true);
       case 'island-off':
         return this.toggleIsland(false);
+      case 'set-voice':
+        return this.chooseVoice(id);
+      case 'voice-test':
+        return void this.speakOut(VOICE_SAMPLE);
       case 'wake-on':
         return this.toggleWake(true);
       case 'wake-off':
@@ -1779,6 +2075,7 @@ class App {
       <div class="card">${st.island && this.islandOn ? '<b>Включён.</b> <span class="muted">Тук живёт вверху экрана, вокруг камеры. Нажатие — выпадающее окно, долгое нажатие — всё приложение.</span>' : '<span class="muted">Маленький анимированный Тук вверху экрана поверх любых приложений. Нажали — открылось небольшое окно: голос, записи, дела на сегодня.</span>'}
       <div class="row">${st.island && this.islandOn ? '<button class="pill ghost small" data-act="island-off">Убрать</button>' : '<button class="pill small" data-act="island-on">Включить</button>'}</div>
       <p class="muted small">Нужно разрешение «Поверх других приложений». В шторке появится тихое уведомление «Тук рядом» — так Android не выгружает Тука.</p></div>
+      ${this.voiceHtml()}
       ${this.wakeHtml()}
       <h3>Голос</h3>
       <label class="toggle"><input type="checkbox" id="set-voiceloop" ${st.voiceLoop !== false ? 'checked' : ''}> Продолжать разговор после ответа</label>

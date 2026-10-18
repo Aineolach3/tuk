@@ -144,7 +144,106 @@ class WllamaEngine implements Engine {
   }
 }
 
+// ---------- llama.cpp нативно (Android) ----------
+
+/** Вызов нативного плагина; подставляется из platform.ts, чтобы brain.ts не зависел от Tauri. */
+export type NativeCall = (action: string, args?: Record<string, unknown>) => Promise<any>;
+
+const fileName = (url: string) => url.split('/').pop()!.split('?')[0];
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * На телефоне модель не грузится в WebView (там мало памяти — приложение падало),
+ * а работает в нативном llama.cpp: файл читается с диска через mmap.
+ */
+export class NativeEngine implements Engine {
+  constructor(private call: NativeCall) {}
+
+  async isCached(url: string): Promise<boolean> {
+    const r = await this.call('status', { name: fileName(url) });
+    return !!r?.exists;
+  }
+
+  async load(m: ModelInfo, onProgress: (done: number, total: number) => void): Promise<void> {
+    const name = fileName(m.url);
+    if (!(await this.isCached(m.url))) {
+      await this.call('download', { url: m.url, name, bytes: m.bytes });
+      for (;;) {
+        await sleep(500);
+        const st = await this.call('status', { name });
+        if (st.state === 'error') throw new Error(st.error ?? 'Не удалось скачать модель');
+        if (st.state === 'downloading') onProgress(st.progress ?? 0, st.total || m.bytes);
+        else if (st.exists) break;
+      }
+    }
+    onProgress(m.bytes, m.bytes);
+    await this.call('load', { name, ctx: 3072 });
+    for (;;) {
+      await sleep(300);
+      const st = await this.call('status', { name });
+      if (st.state === 'ready') return;
+      if (st.state === 'error') throw new Error(st.error ?? 'Не удалось загрузить модель');
+    }
+  }
+
+  async chat(m: ModelInfo, messages: ChatMsg[], onText: (full: string) => void, signal?: AbortSignal): Promise<string> {
+    const msgs = messages.map((x) => ({ role: x.role, content: x.content }));
+    // Qwen3 «гибрид»: мягкий переключатель — ответ без рассуждений
+    if (m.noThink) {
+      const last = [...msgs].reverse().find((x) => x.role === 'user');
+      if (last && !last.content.includes('/no_think')) last.content += ' /no_think';
+    }
+    const r = await this.call('chat', {
+      roles: msgs.map((x) => x.role),
+      contents: msgs.map((x) => x.content),
+      maxTokens: 400,
+      temp: 0.7,
+      topP: 0.9,
+      topK: 40,
+    });
+    const id = r.id as number;
+    let shown = '';
+    for (;;) {
+      if (signal?.aborted) {
+        await this.call('stop');
+        throw new DOMException('Остановлено', 'AbortError');
+      }
+      await sleep(120);
+      const p = await this.call('poll', { id });
+      const txt = cleanReply(String(p.text ?? ''));
+      if (txt !== shown) {
+        shown = txt;
+        onText(txt);
+      }
+      if (p.error) throw new Error(p.error);
+      if (p.done) return cleanReply(String(p.text ?? '')).trim();
+    }
+  }
+
+  async forget(): Promise<void> {
+    for (const m of Object.values(MODELS)) await this.call('delete', { name: fileName(m.url) }).catch(() => {});
+  }
+}
+
 // ---------- Мозг ----------
+
+/** Защита от «вечного падения»: если прошлый запуск упал во время загрузки модели — не грузим её сами. */
+const GUARD = 'tuk-brain-loading';
+function guardGet(): string | null {
+  try {
+    return localStorage.getItem(GUARD);
+  } catch {
+    return null;
+  }
+}
+function guardSet(v: string | null) {
+  try {
+    if (v) localStorage.setItem(GUARD, v);
+    else localStorage.removeItem(GUARD);
+  } catch {
+    /* хранилище недоступно — без защиты */
+  }
+}
 
 export class Brain {
   state: BrainState = { s: 'absent' };
@@ -153,10 +252,10 @@ export class Brain {
   private engine: Engine;
   private queue: Promise<unknown> = Promise.resolve();
 
-  constructor(modelId: ModelId, engine?: Engine) {
+  constructor(modelId: ModelId, engine?: Engine, native?: NativeCall) {
     this.model = MODELS[modelId];
     // в тестах можно подставить свой движок через globalThis.__TUK_ENGINE__
-    this.engine = engine ?? ((globalThis as any).__TUK_ENGINE__ as Engine) ?? new WllamaEngine();
+    this.engine = engine ?? ((globalThis as any).__TUK_ENGINE__ as Engine) ?? (native ? new NativeEngine(native) : new WllamaEngine());
   }
 
   private set(s: BrainState) {
@@ -171,6 +270,12 @@ export class Brain {
   /** При запуске: если модель уже скачана — загрузить её в память. */
   async init(): Promise<void> {
     try {
+      const crashed = guardGet();
+      if (crashed) {
+        guardSet(null);
+        this.set({ s: 'error', why: 'В прошлый раз приложение закрылось, пока загружался мозг. Нажмите «Загрузить», чтобы попробовать ещё раз, или выберите «Лёгкий».' });
+        return;
+      }
       if (await this.engine.isCached(this.model.url)) await this.start();
       else this.set({ s: 'absent' });
     } catch (e) {
@@ -183,13 +288,18 @@ export class Brain {
     if (this.state.s === 'downloading' || this.state.s === 'loading') return;
     try {
       const cached = await this.engine.isCached(this.model.url).catch(() => false);
+      if (cached) guardSet(this.model.id);
       this.set(cached ? { s: 'loading' } : { s: 'downloading', done: 0, total: this.model.bytes });
       await this.engine.load(this.model, (done, total) => {
-        if (done >= total) this.set({ s: 'loading' });
-        else this.set({ s: 'downloading', done, total });
+        if (done >= total) {
+          guardSet(this.model.id);
+          this.set({ s: 'loading' });
+        } else this.set({ s: 'downloading', done, total });
       });
+      guardSet(null);
       this.set({ s: 'ready' });
     } catch (e) {
+      guardSet(null);
       this.set({ s: 'error', why: humanError(e) });
     }
   }

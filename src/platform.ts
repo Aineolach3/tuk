@@ -296,9 +296,9 @@ export async function listenStop(cancel = false): Promise<void> {
 }
 
 /** Произнести текст; промис завершается, когда Тук договорил. */
-export async function speak(text: string): Promise<void> {
+export async function speak(text: string, voicePreset?: string): Promise<void> {
   if (kind === 'android') {
-    await invoke('plugin:tuk|speak', { text });
+    await invoke('plugin:tuk|speak', { text, voice: voicePreset || undefined });
     return;
   }
   const ss = (globalThis as any).speechSynthesis as SpeechSynthesis | undefined;
@@ -318,4 +318,41 @@ export async function speak(text: string): Promise<void> {
 export async function speakStop(): Promise<void> {
   if (kind === 'android') await invoke('plugin:tuk|speak', { stop: true }).catch(() => {});
   else (globalThis as any).speechSynthesis?.cancel();
+}
+
+// ---------------- Нативный мозг, живой голос, действия (Android) ----------------
+
+/** llama.cpp на телефоне: status | download | load | chat | poll | stop | delete. */
+export async function llm(action: string, args: Record<string, unknown> = {}): Promise<any> {
+  return invoke('plugin:tuk|llm', { action, ...args });
+}
+
+/** Живой голос: status | download (voice: tuk | bright | boy | calm). */
+export async function voice(action: string, preset: string): Promise<{ state: string; progress?: number; error?: string } | null> {
+  if (kind !== 'android') return null;
+  return invoke('plugin:tuk|voice', { action, voice: preset });
+}
+
+/** Действие на телефоне (будильник, звонок, фонарик…). */
+export async function act(action: string, args: Record<string, unknown> = {}): Promise<any> {
+  if (kind !== 'android') throw new Error('Это действие доступно на телефоне');
+  return invoke('plugin:tuk|act', { action, ...args });
+}
+
+/** ПК: открыть сайт, файл или программу (notepad, calc, ms-settings: …). */
+export async function openTarget(target: string): Promise<void> {
+  if (kind === 'desktop') await invoke('open_target', { target });
+  else if (kind === 'web') window.open(target, '_blank');
+  else await act('url', { url: target });
+}
+
+/** Освободить место от старого мозга в WebView (раньше модель хранилась там). */
+export async function clearWebModelCache(): Promise<void> {
+  try {
+    const root: any = await (navigator.storage as any)?.getDirectory?.();
+    if (!root) return;
+    for await (const [name] of root.entries()) await root.removeEntry(name, { recursive: true });
+  } catch {
+    /* нечего чистить */
+  }
 }

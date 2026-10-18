@@ -228,6 +228,33 @@ async fn media_control(action: String) -> Result<(), String> {
     }
 }
 
+/// Открыть сайт, файл или программу (команды «открой блокнот», «найди в интернете …»).
+#[tauri::command]
+fn open_target(target: String) -> Result<(), String> {
+    let t = target.trim();
+    if t.is_empty() || t.contains('"') || t.contains('&') || t.contains('|') || t.contains('\n') {
+        return Err("Не могу это открыть".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", t])
+            .creation_flags(0x0800_0000) // без чёрного окна
+            .spawn()
+            .map(|_| ())
+            .map_err(err)
+    }
+    #[cfg(all(not(windows), desktop))]
+    {
+        std::process::Command::new("xdg-open").arg(t).spawn().map(|_| ()).map_err(err)
+    }
+    #[cfg(mobile)]
+    {
+        Err("На телефоне — через плагин".into())
+    }
+}
+
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     app.exit(0);
@@ -334,7 +361,8 @@ pub fn run() {
             cursor_rel,
             media_info,
             media_thumb,
-            media_control
+            media_control,
+            open_target
         ])
         .setup(|app| {
             #[cfg(desktop)]

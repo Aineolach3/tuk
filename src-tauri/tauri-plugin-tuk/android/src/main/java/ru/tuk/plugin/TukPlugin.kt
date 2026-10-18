@@ -48,6 +48,53 @@ class SpeakArgs {
     var text: String? = null
     var stop: Boolean? = null
     var rate: Float? = null
+    /** Живой голос: tuk | bright | boy | calm; пусто — системный синтез. */
+    var voice: String? = null
+}
+
+@InvokeArg
+class VoiceArgs {
+    var action: String = "status"
+    var voice: String = "tuk"
+}
+
+@InvokeArg
+class LlmArgs {
+    var action: String = "status"
+    var name: String? = null
+    var url: String? = null
+    var bytes: Long? = null
+    var ctx: Int? = null
+    var roles: List<String>? = null
+    var contents: List<String>? = null
+    var maxTokens: Int? = null
+    var temp: Float? = null
+    var topP: Float? = null
+    var topK: Int? = null
+    var id: Int? = null
+}
+
+@InvokeArg
+class ActArgs {
+    var action: String = ""
+    var hour: Int? = null
+    var minute: Int? = null
+    var days: List<Int>? = null
+    var label: String? = null
+    var seconds: Int? = null
+    var number: String? = null
+    var text: String? = null
+    var pkg: String? = null
+    var url: String? = null
+    var on: Boolean? = null
+    var dir: String? = null
+    var key: String? = null
+    var place: String? = null
+    var query: String? = null
+    var title: String? = null
+    var begin: Long? = null
+    var end: Long? = null
+    var which: String? = null
 }
 
 @TauriPlugin
@@ -326,6 +373,7 @@ class TukPlugin(private val activity: Activity) : Plugin(activity) {
         val a = invoke.parseArgs(SpeakArgs::class.java)
         if (a.stop == true) {
             tts?.stop()
+            Voice.stop()
             invoke.resolve()
             return
         }
@@ -334,11 +382,120 @@ class TukPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.resolve()
             return
         }
+        val preset = a.voice
+        if (!preset.isNullOrEmpty() && Voice.ready(activity, (Voice.PRESETS[preset] ?: Voice.PRESETS.getValue("tuk")).model)) {
+            tts?.stop()
+            Thread {
+                val ok = runCatching { Voice.speak(activity, preset, text, a.rate ?: 1f) }.getOrDefault(false)
+                if (ok) invoke.resolve()
+                else activity.runOnUiThread { speakSystem(text, a.rate, invoke) }
+            }.start()
+            return
+        }
+        speakSystem(text, a.rate, invoke)
+    }
+
+    private fun speakSystem(text: String, rate: Float?, invoke: Invoke) {
         ensureTts()
-        a.rate?.let { tts?.setSpeechRate(it) }
+        rate?.let { tts?.setSpeechRate(it) }
         if (ttsReady) say(text, invoke) else {
             queued?.second?.resolve()
             queued = text to invoke
+        }
+    }
+
+    // ---------------- Живой голос ----------------
+
+    @Command
+    fun voice(invoke: Invoke) {
+        val a = invoke.parseArgs(VoiceArgs::class.java)
+        val r = JSObject()
+        when (a.action) {
+            "download" -> Voice.download(activity, a.voice)
+            "status" -> {}
+        }
+        r.put("state", Voice.status(activity, a.voice))
+        r.put("progress", Voice.progress)
+        Voice.error?.let { r.put("error", it) }
+        invoke.resolve(r)
+    }
+
+    // ---------------- Мозг (llama.cpp) ----------------
+
+    @Command
+    fun llm(invoke: Invoke) {
+        val a = invoke.parseArgs(LlmArgs::class.java)
+        val r = JSObject()
+        try {
+            when (a.action) {
+                "status" -> {
+                    a.name?.let { r.put("exists", Llm.exists(activity, it)) }
+                }
+                "download" -> Llm.download(activity, a.url ?: throw Exception("нет адреса"), a.name ?: throw Exception("нет имени"), a.bytes ?: 0L)
+                "cancel" -> Llm.cancel()
+                "load" -> Llm.load(activity, a.name ?: throw Exception("нет имени"), a.ctx ?: 3072)
+                "unload" -> Llm.unload()
+                "delete" -> Llm.delete(activity, a.name ?: throw Exception("нет имени"))
+                "chat" -> {
+                    val roles = (a.roles ?: emptyList()).toTypedArray()
+                    val contents = (a.contents ?: emptyList()).toTypedArray()
+                    r.put("id", Llm.chat(roles, contents, a.maxTokens ?: 400, a.temp ?: 0.7f, a.topP ?: 0.9f, a.topK ?: 40))
+                }
+                "poll" -> {
+                    r.put("text", Llm.text())
+                    r.put("done", Llm.genDone || (a.id != null && a.id != Llm.genId))
+                    Llm.genError?.let { r.put("error", it) }
+                }
+                "stop" -> Llm.stop()
+            }
+            r.put("state", Llm.state)
+            r.put("progress", Llm.progress)
+            r.put("total", Llm.total)
+            Llm.error?.let { r.put("error", it) }
+            invoke.resolve(r)
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: e.toString())
+        }
+    }
+
+    // ---------------- Действия ----------------
+
+    private val actions by lazy { Actions(activity) }
+
+    @Command
+    fun act(invoke: Invoke) {
+        val a = invoke.parseArgs(ActArgs::class.java)
+        val r = JSObject()
+        try {
+            when (a.action) {
+                "perm" -> r.put("granted", actions.hasPermission(a.which ?: ""))
+                "ask" -> actions.request(a.which ?: "")
+                "alarm" -> actions.alarm(a.hour ?: 7, a.minute ?: 0, a.label, a.days)
+                "timer" -> actions.timer(a.seconds ?: 60, a.label)
+                "contacts" -> r.put("list", actions.contacts())
+                "call" -> r.put("direct", actions.call(a.number ?: throw Exception("Нет номера")))
+                "sms" -> actions.sms(a.number ?: throw Exception("Нет номера"), a.text ?: "")
+                "apps" -> r.put("list", actions.apps())
+                "open" -> actions.open(a.pkg ?: throw Exception("Нет приложения"))
+                "url" -> actions.url(a.url ?: throw Exception("Нет адреса"))
+                "torch" -> actions.torch(a.on ?: true)
+                "volume" -> r.put("level", actions.volume(a.dir ?: "up"))
+                "media" -> actions.media(a.key ?: "toggle")
+                "navigate" -> actions.navigate(a.place ?: "")
+                "search" -> actions.search(a.query ?: "")
+                "battery" -> {
+                    val b = actions.battery()
+                    r.put("level", b.getInt("level"))
+                    r.put("charging", b.getBoolean("charging"))
+                }
+                "calendar" -> actions.calendar(a.title ?: "Событие", a.begin ?: System.currentTimeMillis(), a.end ?: ((a.begin ?: System.currentTimeMillis()) + 3_600_000))
+                "camera" -> actions.camera()
+                "settings" -> actions.settings(a.which ?: "main")
+                else -> throw Exception("Неизвестное действие ${a.action}")
+            }
+            invoke.resolve(r)
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: e.toString())
         }
     }
 }

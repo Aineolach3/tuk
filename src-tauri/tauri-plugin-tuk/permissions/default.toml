@@ -1,3 +1,3 @@
 [default]
 description = "Остров, распознавание и синтез речи"
-permissions = ["allow-island", "allow-listen", "allow-speak"]
+permissions = ["allow-island", "allow-listen", "allow-speak", "allow-voice", "allow-llm", "allow-act"]
