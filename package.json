@@ -1,0 +1,16 @@
+{
+  "name": "tuk",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p . && node scripts/copy-static.mjs",
+    "test": "tsx --test tests/parser.test.ts tests/sync.test.ts",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}

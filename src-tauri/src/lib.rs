@@ -1,0 +1,247 @@
+//! Тук — Rust-часть. Здесь только то, чего не может веб-интерфейс:
+//! файл с данными, окно-строка у верхнего края экрана, трей, горячая клавиша,
+//! сеть между ПК и телефоном. Вся логика помощника — в TypeScript (папка src).
+
+mod net;
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+#[derive(Default)]
+struct AppState {
+    server: Mutex<Option<Arc<net::Server>>>,
+}
+
+fn err<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
+
+// ---------- Данные ----------
+
+fn data_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(err)?;
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    Ok(dir.join("tuk-data.json"))
+}
+
+#[tauri::command]
+fn load_data(app: AppHandle) -> Result<Option<String>, String> {
+    let p = data_path(&app)?;
+    match std::fs::read_to_string(&p) {
+        Ok(s) if !s.trim().is_empty() => Ok(Some(s)),
+        // основной файл пуст или пропал — пробуем резервную копию
+        _ => Ok(std::fs::read_to_string(p.with_extension("json.bak")).ok()),
+    }
+}
+
+#[tauri::command]
+fn save_data(app: AppHandle, json: String) -> Result<(), String> {
+    let p = data_path(&app)?;
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, json.as_bytes()).map_err(err)?;
+    if p.exists() {
+        let _ = std::fs::copy(&p, p.with_extension("json.bak"));
+    }
+    // на Windows rename заменяет существующий файл
+    std::fs::rename(&tmp, &p).map_err(err)
+}
+
+// ---------- Окно-строка (только ПК) ----------
+
+#[tauri::command]
+fn set_mode(window: tauri::WebviewWindow, mode: String) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        let (w, h) = match mode.as_str() {
+            "collapsed" => (190.0, 44.0),
+            "compact" => (420.0, 78.0),
+            _ => (440.0, 640.0),
+        };
+        window.set_size(tauri::LogicalSize::new(w, h)).map_err(err)?;
+        if let Some(m) = window.current_monitor().map_err(err)? {
+            let scale = m.scale_factor();
+            let pos = m.position();
+            let size = m.size();
+            let x = pos.x + ((size.width as f64 - w * scale) / 2.0).round() as i32;
+            window.set_position(tauri::PhysicalPosition::new(x, pos.y)).map_err(err)?;
+        }
+        if mode == "expanded" {
+            let _ = window.set_focus();
+        }
+    }
+    #[cfg(mobile)]
+    let _ = (window, mode);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        let m = app.autolaunch();
+        let on = m.is_enabled().unwrap_or(false);
+        if enabled && !on {
+            m.enable().map_err(err)?;
+        } else if !enabled && on {
+            m.disable().map_err(err)?;
+        }
+    }
+    #[cfg(mobile)]
+    let _ = (app, enabled);
+    Ok(())
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
+}
+
+// ---------- Сеть ----------
+
+#[tauri::command]
+fn local_ip() -> String {
+    net::local_ip().unwrap_or_else(|| "127.0.0.1".into())
+}
+
+/// ПК: запустить сервер синхронизации и маяк. Каждый запрос уходит в интерфейс событием `sync-request`.
+#[tauri::command]
+fn server_start(app: AppHandle, state: State<'_, AppState>, port: u16, beacon: String) -> Result<(), String> {
+    let mut slot = state.server.lock().unwrap();
+    if slot.is_some() {
+        return Ok(());
+    }
+    let handle = app.clone();
+    let srv = net::start_server(port, move |id, path, body| {
+        let payload = format!(
+            "{{\"id\":{},\"path\":{},\"body\":{}}}",
+            id,
+            net::json_str(&path),
+            net::json_str(&body)
+        );
+        let _ = handle.emit("sync-request", payload);
+    })
+    .map_err(|e| format!("Порт {port} занят или закрыт: {e}"))?;
+    net::start_beacon(beacon);
+    *slot = Some(srv);
+    Ok(())
+}
+
+#[tauri::command]
+fn server_reply(state: State<'_, AppState>, id: u64, status: u16, body: String) {
+    if let Some(s) = state.server.lock().unwrap().as_ref() {
+        s.reply(id, status, body);
+    }
+}
+
+/// Телефон: запрос к ПК. Выполняется в отдельном потоке, чтобы не тормозить интерфейс.
+#[tauri::command]
+async fn http_post(host: String, port: u16, path: String, body: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || net::http_post(&host, port, &path, &body))
+        .await
+        .map_err(err)?
+}
+
+#[tauri::command]
+async fn discover(ms: u64) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || net::discover(ms.min(10_000)))
+        .await
+        .map_err(err)?
+}
+
+// ---------- Запуск ----------
+
+#[cfg(desktop)]
+fn show_main(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let mut builder = tauri::Builder::default()
+        .manage(AppState::default())
+        .plugin(tauri_plugin_notification::init());
+
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--autostart"]),
+        ));
+    }
+    #[cfg(mobile)]
+    {
+        builder = builder.plugin(tauri_plugin_barcode_scanner::init());
+    }
+
+    builder
+        .invoke_handler(tauri::generate_handler![
+            load_data,
+            save_data,
+            set_mode,
+            set_autostart,
+            quit_app,
+            local_ip,
+            server_start,
+            server_reply,
+            http_post,
+            discover
+        ])
+        .setup(|app| {
+            #[cfg(desktop)]
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::TrayIconBuilder;
+                use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+
+                // Трей
+                let open = MenuItem::with_id(app, "open", "Открыть Тук", true, None::<&str>)?;
+                let link = MenuItem::with_id(app, "link", "Связь с телефоном", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&open, &link, &quit])?;
+                let mut tray = TrayIconBuilder::with_id("main")
+                    .tooltip("Тук")
+                    .menu(&menu)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "open" => {
+                            show_main(app);
+                            let _ = app.emit("toggle", ());
+                        }
+                        "link" => {
+                            show_main(app);
+                            let _ = app.emit("open-link", ());
+                        }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    });
+                if let Some(icon) = app.default_window_icon() {
+                    tray = tray.icon(icon.clone());
+                }
+                tray.build(app)?;
+
+                // Ctrl+Alt+Пробел — открыть/свернуть строку
+                let toggle = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space);
+                let toggle_for_handler = toggle.clone();
+                app.handle().plugin(
+                    tauri_plugin_global_shortcut::Builder::new()
+                        .with_handler(move |app, shortcut, event| {
+                            if shortcut == &toggle_for_handler && event.state() == ShortcutState::Pressed {
+                                show_main(app);
+                                let _ = app.emit("toggle", ());
+                            }
+                        })
+                        .build(),
+                )?;
+                if let Err(e) = app.global_shortcut().register(toggle) {
+                    eprintln!("Горячая клавиша занята другой программой: {e}");
+                }
+            }
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("не удалось запустить Тук");
+}

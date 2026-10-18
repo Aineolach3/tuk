@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <title>Тук</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="shell">
+    <header id="bar" title="Тук">
+      <canvas id="char" aria-label="Персонаж"></canvas>
+      <div id="bar-text"></div>
+      <div id="bar-actions"></div>
+      <span id="bar-badge"></span>
+      <button id="gear" data-act="tab" data-id="settings" aria-label="Настройки">⚙</button>
+    </header>
+    <main id="panel">
+      <div id="reply" role="status" aria-live="polite"></div>
+      <form id="input-form" autocomplete="off">
+        <input id="input" enterkeyhint="send" placeholder="Что записать или о чём напомнить?" aria-label="Команда">
+        <button type="submit" aria-label="Отправить">↑</button>
+      </form>
+      <nav id="tabs">
+        <button data-tab="today">Сегодня</button>
+        <button data-tab="tasks">Дела</button>
+        <button data-tab="reminders">Напоминания</button>
+        <button data-tab="health">Здоровье</button>
+        <button data-tab="notes">Заметки</button>
+      </nav>
+      <section id="view"></section>
+      <footer><span id="link-status" class="link-status off"></span></footer>
+    </main>
+  </div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
