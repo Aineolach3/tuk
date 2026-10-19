@@ -313,6 +313,74 @@ pub fn claude_write(json: &str) -> Result<String, String> {
     Ok(p.display().to_string())
 }
 
+// ---------- Хуки других агентов (Codex CLI, Gemini CLI) ----------
+
+/// Файл настроек хуков агента. Claude Code — ~/.claude/settings.json,
+/// Codex CLI — ~/.codex/hooks.json, Gemini CLI — ~/.gemini/settings.json.
+pub fn agent_config_path(agent: &str) -> Result<PathBuf, String> {
+    match agent {
+        "claude" => Ok(claude_settings_path()),
+        "codex" => Ok(home().join(".codex").join("hooks.json")),
+        "gemini" => Ok(home().join(".gemini").join("settings.json")),
+        _ => Err("Неизвестный агент".into()),
+    }
+}
+
+/// Содержимое файла хуков агента (пусто, если файла нет). BOM убирается.
+pub fn agent_config_read(agent: &str) -> Result<String, String> {
+    match std::fs::read_to_string(agent_config_path(agent)?) {
+        Ok(s) => Ok(s.trim_start_matches('\u{feff}').to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Записать файл хуков агента; перед первой записью — резервная копия рядом.
+pub fn agent_config_write(agent: &str, json: &str) -> Result<String, String> {
+    let p = agent_config_path(agent)?;
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).map_err(err)?;
+    }
+    let backup = p.with_extension("json.tuk-backup");
+    if p.exists() && !backup.exists() {
+        std::fs::copy(&p, &backup).map_err(err)?;
+    }
+    std::fs::write(&p, json).map_err(err)?;
+    Ok(p.display().to_string())
+}
+
+// ---------- Окно терминала сессии ----------
+
+/// Поднять окно терминала, где идёт сессия агента (по процессам из хука);
+/// не вышло — открыть папку проекта в Проводнике. Ответ: "window" | "folder".
+pub fn focus_terminal(pids: Vec<u32>, console: i64, cwd: String) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        if crate::win32::focus_terminal(&pids, console as isize, &cwd) {
+            return Ok("window".into());
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (&pids, console);
+    let dir = std::path::Path::new(cwd.trim());
+    if cwd.trim().is_empty() || !dir.is_absolute() || !dir.is_dir() {
+        return Err("Окно сессии не найдено, и папки проекта нет".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("explorer.exe")
+            .raw_arg(format!("\"{}\"", dir.display()))
+            .spawn()
+            .map_err(err)?;
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open").arg(dir).spawn().map_err(err)?;
+    }
+    Ok("folder".into())
+}
+
 // ---------- Музыка (Windows: системные медиа-элементы управления) ----------
 
 #[cfg(windows)]

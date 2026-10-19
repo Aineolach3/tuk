@@ -1,5 +1,5 @@
 //! Сеть без внешних библиотек: маленький HTTP-сервер (на ПК), HTTP-клиент (на телефоне)
-//! и UDP-маяк, по которому телефон находит ПК в локальной сети.
+//! UDP-маяк, по которому телефон находит ПК в локальной сети, и «кто рядом» — другие Туки в сети.
 //! Содержимое запросов уже зашифровано на стороне интерфейса (AES-GCM).
 
 use std::collections::HashMap;
@@ -392,6 +392,308 @@ pub fn discover_on(port: u16, ms: u64) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+// ---------- «Кто рядом»: другие Туки в той же сети ----------
+//
+// Отдельный порт и отдельный тип пакета — с маяком связи ПК↔телефон не пересекается.
+// Включается только настройкой «Показываться рядом». В пакете нет ничего о человеке:
+// случайный id на время работы (меняется при каждом включении), метка «свои устройства»
+// (хэш общего ключа связи, меняется каждый час — чужим ничего не говорит), выбранное
+// имя (до 24 символов), цвет капюшона и наряд.
+//
+// TUKN1|вид|id|группа|кому|капюшон|наряд|имя
+//   вид: here (я здесь, раз в 4 с), hi (привет — поле «кому» = id адресата), bye (выключили)
+
+pub const NEAR_PORT: u16 = 47802;
+const NEAR_MAX: usize = 200;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NearPacket {
+    pub kind: String,
+    pub id: String,
+    pub group: String,
+    pub to: String,
+    pub hood: String,
+    pub outfit: String,
+    pub name: String,
+}
+
+fn near_token(s: &str, max: usize) -> bool {
+    s.len() <= max && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+/// Разбор и проверка пакета «рядом». Всё подозрительное — None (пакет молча отбрасывается).
+pub fn parse_near(bytes: &[u8]) -> Option<NearPacket> {
+    if bytes.len() > NEAR_MAX {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut it = text.splitn(8, '|');
+    if it.next()? != "TUKN1" {
+        return None;
+    }
+    let kind = it.next()?;
+    let id = it.next()?;
+    let group = it.next()?;
+    let to = it.next()?;
+    let hood = it.next()?;
+    let outfit = it.next()?;
+    let name = it.next()?;
+    if !matches!(kind, "here" | "hi" | "bye") {
+        return None;
+    }
+    if id.len() < 8 || !near_token(id, 32) || !near_token(group, 32) || !near_token(to, 32) || !near_token(outfit, 16) {
+        return None;
+    }
+    if kind == "hi" && to.is_empty() {
+        return None;
+    }
+    // цвет капюшона — название из палитры («Чёрный», «Мятный»…): буквы, пробел, дефис
+    if hood.chars().count() > 20 || !hood.chars().all(|c| c.is_alphabetic() || c == ' ' || c == '-') {
+        return None;
+    }
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 24 || name.chars().any(|c| c.is_control() || c == '|') {
+        return None;
+    }
+    Some(NearPacket {
+        kind: kind.into(),
+        id: id.into(),
+        group: group.into(),
+        to: to.into(),
+        hood: hood.into(),
+        outfit: outfit.into(),
+        name: name.into(),
+    })
+}
+
+impl NearPacket {
+    pub fn to_json(&self, ip: &str) -> String {
+        format!(
+            "{{\"ip\":{},\"kind\":{},\"id\":{},\"group\":{},\"to\":{},\"hood\":{},\"outfit\":{},\"name\":{}}}",
+            json_str(ip),
+            json_str(&self.kind),
+            json_str(&self.id),
+            json_str(&self.group),
+            json_str(&self.to),
+            json_str(&self.hood),
+            json_str(&self.outfit),
+            json_str(&self.name)
+        )
+    }
+}
+
+/// Пакет, который стоит показать интерфейсу: не свой и не чужой «привет» (адресованный другому).
+pub fn near_wanted(p: &NearPacket, my_id: &str) -> bool {
+    p.id != my_id && (p.kind != "hi" || p.to == my_id)
+}
+
+/// Поле пакета (1 — вид, 2 — id …) — для своего пакета, присланного интерфейсом.
+fn near_field(packet: &str, i: usize) -> String {
+    packet.split('|').nth(i).unwrap_or_default().to_string()
+}
+
+struct Near {
+    payload: Arc<Mutex<String>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    sock: UdpSocket,
+}
+
+static NEAR: Mutex<Option<Near>> = Mutex::new(None);
+
+fn near_broadcast(sock: &UdpSocket, packet: &str, port: u16) {
+    let _ = sock.send_to(packet.as_bytes(), ("255.255.255.255", port));
+}
+
+/// Включить «рядом» (или обновить свой пакет «here», если уже включено).
+/// `on_packet` получает JSON пакета от другого Тука.
+pub fn near_start<F>(packet: String, on_packet: F) -> Result<(), String>
+where
+    F: Fn(String) + Send + 'static,
+{
+    near_start_on(NEAR_PORT, packet, on_packet)
+}
+
+pub fn near_start_on<F>(port: u16, packet: String, on_packet: F) -> Result<(), String>
+where
+    F: Fn(String) + Send + 'static,
+{
+    if parse_near(packet.as_bytes()).map(|p| p.kind) != Some("here".into()) {
+        return Err("Неверный пакет".into());
+    }
+    let mut slot = NEAR.lock().unwrap();
+    if let Some(n) = slot.as_ref() {
+        // уже работает — другое имя или цвет; id мог смениться — тогда перезапуск
+        if near_field(&n.payload.lock().unwrap(), 2) == near_field(&packet, 2) {
+            *n.payload.lock().unwrap() = packet;
+            return Ok(());
+        }
+    }
+    if let Some(old) = slot.take() {
+        old.stop.store(true, Ordering::SeqCst);
+    }
+    // прежний поток приёма отпускает порт в течение ~0,5 с — подождём его
+    let mut tries = 0;
+    let sock = loop {
+        match UdpSocket::bind(("0.0.0.0", port)) {
+            Ok(s) => break s,
+            Err(_) if tries < 8 => {
+                tries += 1;
+                thread::sleep(Duration::from_millis(150));
+            }
+            Err(e) => return Err(format!("Не удалось слушать сеть: {e}")),
+        }
+    };
+    let _ = sock.set_broadcast(true);
+    sock.set_read_timeout(Some(Duration::from_millis(500))).ok();
+    let payload = Arc::new(Mutex::new(packet));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (rsock, ssock) = (sock.try_clone().map_err(|e| e.to_string())?, sock.try_clone().map_err(|e| e.to_string())?);
+    {
+        // приём
+        let stop = stop.clone();
+        let payload = payload.clone();
+        thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            // не больше 40 пакетов в секунду — шумная сеть не завалит интерфейс
+            let mut window = Instant::now();
+            let mut count = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                let Ok((n, from)) = rsock.recv_from(&mut buf) else { continue };
+                let Some(p) = parse_near(&buf[..n]) else { continue };
+                let my_id = near_field(&payload.lock().unwrap(), 2);
+                if !near_wanted(&p, &my_id) {
+                    continue;
+                }
+                if window.elapsed() >= Duration::from_secs(1) {
+                    window = Instant::now();
+                    count = 0;
+                }
+                count += 1;
+                if count <= 40 {
+                    on_packet(p.to_json(&from.ip().to_string()));
+                }
+            }
+        });
+    }
+    {
+        // «я здесь» раз в 4 секунды
+        let stop = stop.clone();
+        let payload = payload.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let p = payload.lock().unwrap().clone();
+                near_broadcast(&ssock, &p, port);
+                for _ in 0..8 {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+        });
+    }
+    *slot = Some(Near { payload, stop, sock });
+    Ok(())
+}
+
+/// Выключить «рядом»: сказать «пока» и перестать слушать.
+pub fn near_stop() {
+    if let Some(n) = NEAR.lock().unwrap().take() {
+        let bye = n.payload.lock().unwrap().replacen("TUKN1|here|", "TUKN1|bye|", 1);
+        if let Ok(addr) = n.sock.local_addr() {
+            near_broadcast(&n.sock, &bye, addr.port());
+        }
+        n.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Отправить «привет» (пакет `hi`). Только когда «рядом» включено.
+pub fn near_send(packet: &str) -> Result<(), String> {
+    let p = parse_near(packet.as_bytes()).ok_or("Неверный пакет")?;
+    if p.kind != "hi" {
+        return Err("Неверный пакет".into());
+    }
+    let slot = NEAR.lock().unwrap();
+    let n = slot.as_ref().ok_or("«Показываться рядом» выключено")?;
+    if p.id != near_field(&n.payload.lock().unwrap(), 2) {
+        return Err("Неверный пакет".into());
+    }
+    let port = n.sock.local_addr().map(|a| a.port()).unwrap_or(NEAR_PORT);
+    near_broadcast(&n.sock, packet, port);
+    Ok(())
+}
+
+// ---------- Хуки: метки в событии ----------
+
+/// Добавить в начало JSON-объекта поля `"ключ":значение` (значение — готовый JSON).
+/// Не объект — текст возвращается как есть. Уже имеющиеся ключи не трогаются.
+pub fn json_prepend(body: &str, fields: &[(&str, String)]) -> String {
+    let t = body.trim_start();
+    if !t.starts_with('{') {
+        return body.to_string();
+    }
+    let rest = t[1..].trim_start();
+    let mut head = String::from("{");
+    for (k, v) in fields {
+        if hook_field(body, k).is_empty() && !has_key(body, k) {
+            head.push_str(&json_str(k));
+            head.push(':');
+            head.push_str(v);
+            head.push(',');
+        }
+    }
+    if rest.starts_with('}') && head.ends_with(',') {
+        head.pop();
+    }
+    head + rest
+}
+
+/// Есть ли ключ верхнего уровня (с любым значением).
+fn has_key(body: &str, key: &str) -> bool {
+    let needle = json_str(key);
+    // грубо, но безопасно: лишняя проверка лишь не добавит метку
+    body.contains(&format!("{needle}:")) || body.contains(&format!("{needle} :"))
+}
+
+/// Событие хука с метками Тука: какой агент (`--agent`), событие из командной строки
+/// (Gemini CLI называет их по-своему) и откуда пришло (`origin` — процессы и окно консоли,
+/// чтобы потом показать окно терминала сессии).
+pub fn hook_prepare(input: &str, args: &[String], origin: Vec<(&'static str, String)>) -> String {
+    let (agent, event) = hook_args(args);
+    let mut fields: Vec<(&str, String)> = Vec::new();
+    if !agent.is_empty() {
+        fields.push(("tuk_agent", json_str(&agent)));
+    }
+    if !event.is_empty() {
+        fields.push(("tuk_event", json_str(&event)));
+    }
+    fields.extend(origin);
+    let t = input.trim();
+    if t.is_empty() {
+        // Gemini CLI может прислать пустой вход — всё равно сообщим о событии
+        return json_prepend("{}", &fields);
+    }
+    json_prepend(t, &fields)
+}
+
+/// Аргументы шлюза: `--hook [--agent имя] [Событие]` → (агент, событие).
+pub fn hook_args(args: &[String]) -> (String, String) {
+    let mut agent = String::new();
+    let mut event = String::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--agent" {
+            agent = it.next().cloned().unwrap_or_default();
+        } else if !a.starts_with('-') && event.is_empty() && near_token(a, 40) && !a.contains(['/', '\\', '.']) {
+            event = a.clone();
+        }
+    }
+    if !near_token(&agent, 24) {
+        agent.clear();
+    }
+    (agent.to_ascii_lowercase(), event)
+}
+
 /// Кодирование в base64 (стандартный алфавит).
 pub fn b64encode(data: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -587,6 +889,85 @@ mod tests {
             assert_eq!(b64decode(&b64encode(v)).unwrap(), v);
         }
         assert_eq!(b64encode(b"Hello"), "SGVsbG8=");
+    }
+
+    #[test]
+    fn near_packets_parse_and_filter() {
+        let p = parse_near("TUKN1|here|a1b2c3d4e5|g77||Мятный|scarf|Тук Ивана".as_bytes()).unwrap();
+        assert_eq!(p.kind, "here");
+        assert_eq!(p.name, "Тук Ивана");
+        assert_eq!(p.hood, "Мятный");
+        // чужой маяк связи, мусор, длинное имя, разделитель в имени, неизвестный вид — мимо
+        for bad in [
+            "TUK1|abc|47800|PC",
+            "TUKN1|here|short|||Чёрный|none|x",
+            "TUKN1|boom|a1b2c3d4e5|||Чёрный|none|x",
+            "TUKN1|here|a1b2c3d4e5|||Чёрный|none|",
+            "TUKN1|here|a1b2c3d4e5|||Чёрный|none|   ",
+            "TUKN1|here|a1b2c3d4e5|||Чёрный|<b>|x",
+            "TUKN1|here|a1b2c3d4e5|||#fff|none|x",
+            "TUKN1|hi|a1b2c3d4e5|||Чёрный|none|x",
+            "TUKN1|here|a1b2c3d4e5|g;drop||Чёрный|none|x",
+            "TUKN1|here|a1b2c3d4e5|||Чёрный|none|очень-очень-длинное-имя-больше-24",
+            "TUKN1|here|a1b2c3d4e5|||Чёрный|none|a\nb",
+        ] {
+            assert!(parse_near(bad.as_bytes()).is_none(), "{bad}");
+        }
+        assert!(parse_near(&[0xff, 0xfe]).is_none());
+        assert!(parse_near(&[b'x'; 300]).is_none());
+        // имя может содержать «|»? нет — splitn(8) отдаёт хвост, и он отвергается
+        assert!(parse_near("TUKN1|here|a1b2c3d4e5|||Чёрный|none|a|b".as_bytes()).is_none());
+
+        let me = "mememe0001";
+        let hi_me = parse_near(format!("TUKN1|hi|a1b2c3d4e5||{me}|Чёрный|none|Тук").as_bytes()).unwrap();
+        let hi_other = parse_near("TUKN1|hi|a1b2c3d4e5||zzzzzzzz01|Чёрный|none|Тук".as_bytes()).unwrap();
+        let mine = parse_near(format!("TUKN1|here|{me}|||Чёрный|none|Тук").as_bytes()).unwrap();
+        assert!(near_wanted(&p, me));
+        assert!(near_wanted(&hi_me, me));
+        assert!(!near_wanted(&hi_other, me));
+        assert!(!near_wanted(&mine, me));
+        let j = p.to_json("192.168.1.5");
+        assert!(j.contains("\"ip\":\"192.168.1.5\"") && j.contains("\"name\":\"Тук Ивана\""), "{j}");
+    }
+
+    #[test]
+    fn near_two_instances_meet() {
+        // два «Тука» на одном порту не встанут — проверяем приём и отправку через свой порт
+        let port = 47913;
+        let got: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        near_start_on(port, "TUKN1|here|mememe0001|||Чёрный|none|Я".into(), move |j| g.lock().unwrap().push(j)).unwrap();
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.send_to("TUKN1|here|other00001|||Мятный|crown|Сосед".as_bytes(), ("127.0.0.1", port)).unwrap();
+        s.send_to("TUKN1|hi|other00001||mememe0001|Мятный|crown|Сосед".as_bytes(), ("127.0.0.1", port)).unwrap();
+        s.send_to("TUKN1|hi|other00001||someone001|Мятный|crown|Сосед".as_bytes(), ("127.0.0.1", port)).unwrap();
+        s.send_to("TUKN1|here|mememe0001|||Чёрный|none|Я".as_bytes(), ("127.0.0.1", port)).unwrap();
+        thread::sleep(Duration::from_millis(400));
+        assert!(near_send("TUKN1|hi|mememe0001||other00001|Чёрный|none|Я").is_ok());
+        assert!(near_send("TUKN1|hi|stranger01||other00001|Чёрный|none|Я").is_err());
+        assert!(near_send("TUKN1|here|mememe0001|||Чёрный|none|Я").is_err());
+        near_stop();
+        assert!(near_send("TUKN1|hi|mememe0001||other00001|Чёрный|none|Я").is_err());
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got[0].contains("\"kind\":\"here\"") && got[1].contains("\"kind\":\"hi\""));
+    }
+
+    #[test]
+    fn hook_tags() {
+        assert_eq!(json_prepend("{\"a\":1}", &[("tuk_agent", json_str("codex"))]), "{\"tuk_agent\":\"codex\",\"a\":1}");
+        assert_eq!(json_prepend(" { } ", &[("x", "1".into())]), "{\"x\":1} ");
+        assert_eq!(json_prepend("{\"tuk_agent\":\"gemini\"}", &[("tuk_agent", json_str("codex"))]), "{\"tuk_agent\":\"gemini\"}");
+        assert_eq!(json_prepend("[1]", &[("x", "1".into())]), "[1]");
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(hook_args(&s(&["--hook", "--agent", "Gemini", "PreToolUse"])), ("gemini".into(), "PreToolUse".into()));
+        assert_eq!(hook_args(&s(&["--hook"])), (String::new(), String::new()));
+        assert_eq!(hook_args(&s(&["--hook", "--agent", "bad name!"])), (String::new(), String::new()));
+        assert_eq!(hook_args(&s(&["C:\\x\\Tuk.exe", "--hook", "--agent", "codex"])), ("codex".into(), String::new()));
+        let out = hook_prepare("{\"hook_event_name\":\"BeforeTool\"}", &s(&["--hook", "--agent", "gemini", "PreToolUse"]), vec![("tuk_pids", "[1,2]".into())]);
+        assert_eq!(out, "{\"tuk_agent\":\"gemini\",\"tuk_event\":\"PreToolUse\",\"tuk_pids\":[1,2],\"hook_event_name\":\"BeforeTool\"}");
+        assert_eq!(hook_prepare("", &s(&["--hook"]), vec![]), "{}");
+        assert_eq!(hook_prepare("{\"a\":1}", &s(&["--hook"]), vec![]), "{\"a\":1}");
     }
 
     #[test]

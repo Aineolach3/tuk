@@ -5,7 +5,8 @@ import { play, setVolume, type Sound } from './sounds.js';
 import { KIND_ICON, MAX_CHARS, describe, extractTasks, filesContext, fitBudget, fmtSize, noteFromFile, readFile, truncationNote, type FileCard } from './files.js';
 import { LOCAL_PRESETS, isLocalUrl, listModels, localChat } from './localai.js';
 import { computeRecap, renderRecap } from './recap.js';
-import { AgentHub, KIND_LABEL, STATUS_LABEL, demoScript, duration, hooksInstalled, installHooks, uninstallHooks, type HubEvent, type Pending, type Session } from './agents.js';
+import { AGENT_HOOK_INFO, AgentHub, KIND_LABEL, STATUS_LABEL, agentConfig, agentHooksInstalled, demoScript, diffHtml, duration, focusTerminal, hooksInstalled, installAgentHooks, installHooks, uninstallAgentHooks, uninstallHooks, type HookAgent, type HubEvent, type Pending, type Session } from './agents.js';
+import { NearStrip, Nearby, cleanName, nearSettingsHtml, type NearPeer } from './nearby.js';
 import { runPet, type PetState } from './pet.js';
 import { METRIC_LABEL, healthText, type Item, type Metric } from './model.js';
 import { REPEAT_LABEL, fmtDay, fmtTime, fmtWhen, normalize, parse } from './parser.js';
@@ -95,6 +96,9 @@ class App {
   hub: AgentHub;
   remote: { sessions: Session[]; pending: Pending[] } | null = null;
   claudeHooks: boolean | null = null;
+  agentHooks: Partial<Record<HookAgent, boolean>> = {};
+  nearby = new Nearby(() => this.store?.data.sync.key);
+  nearStrip = new NearStrip(() => document.getElementById('bar-text'));
   media: P.Media | null = null;
   mediaTitle = '';
   mediaCover = '';
@@ -164,6 +168,7 @@ class App {
   }
 
   async start(): Promise<void> {
+    void this.startNearby();
     // ПК отвечает телефону своим мозгом
     this.link.chatHandler = (messages) => (this.brain.ready ? this.brain.chat(messages, () => {}) : Promise.reject(new Error('Мозг на ПК не загружен')));
     void this.brain.init();
@@ -181,6 +186,7 @@ class App {
       // файлы из Проводника (нативный drag & drop Tauri): [{ name, path, data? (base64), size? }]
       await P.listen('files-drop', (payload: { files?: DroppedFile[] } | DroppedFile[]) => void this.takeDropped(Array.isArray(payload) ? payload : payload?.files ?? []));
       void this.checkClaude();
+      void this.checkAgentHooks();
     } else if (P.kind === 'android') {
       this.link.startClient();
       setInterval(() => void this.pollAgents(), 3000);
@@ -794,6 +800,7 @@ class App {
     this.char.hood = HOOD_COLORS[st.hoodColor ?? 'Чёрный'] ?? HOOD_COLORS['Чёрный'];
     this.char.idleLight = st.lightColor ? LIGHT_COLORS[st.lightColor] ?? null : null;
     setVolume(st.volume ?? 0.5);
+    if (this.nearby?.on) void this.startNearby(); // соседи увидят новый наряд и цвет
   }
 
   /** Тычок в персонажа: злится, а после трёх быстрых — кружится голова. */
@@ -1202,12 +1209,13 @@ class App {
       for (const s of sess) {
         h += `<div class="session" id="s-${esc(s.id)}" style="--sc:${esc(s.color ?? '#f4c470')}"><h3><i class="dotc"></i>${esc(s.project)} <span class="pill-status st-${s.status}">${STATUS_LABEL[s.status]}</span>
           <span class="muted small">${esc(s.agent)}${s.started ? ` · ${duration(now - s.started)}` : ''}${s.plus || s.minus ? ` · <span class="plus">+${s.plus}</span> <span class="minus">−${s.minus}</span>` : ''}</span>
-          <button class="x" data-act="agent-close" data-id="${esc(s.id)}" title="Закрыть сессию: убрать пилюлю, её вопросы уйдут в терминал" aria-label="Закрыть сессию">×</button></h3>`;
+          ${P.kind === 'desktop' && this.agentsLocal && !this.demo ? `<button class="x" data-act="agent-term" data-id="${esc(s.id)}" title="Перейти в окно терминала этой сессии" aria-label="Перейти в терминал">↗</button>` : ''}<button class="x" data-act="agent-close" data-id="${esc(s.id)}" title="Закрыть сессию: убрать пилюлю, её вопросы уйдут в терминал" aria-label="Закрыть сессию">×</button></h3>`;
         if (s.prompt) h += `<p class="muted small">«${esc(s.prompt)}»</p>`;
-        const steps = s.steps.slice(-10).reverse();
+        const from = Math.max(0, s.steps.length - 10);
+        const steps = s.steps.slice(from).map((st, k) => [st, from + k] as const).reverse();
         if (steps.length)
           h += `<ul class="steps">${steps
-            .map((st) => `<li><span class="k k-${st.kind}">${KIND_LABEL[st.kind]}</span> <span class="tx">${esc(st.text)}</span>${st.plus != null ? ` <span class="plus">+${st.plus}</span> <span class="minus">−${st.minus}</span>` : ''}</li>`)
+            .map(([st, i]) => `<li${st.diff ? ` class="has-diff" data-act="agent-diff" data-id="${esc(s.id)}" data-i="${i}" title="Показать правку целиком"` : ''}><span class="k k-${st.kind}">${KIND_LABEL[st.kind]}</span> <span class="tx">${esc(st.text)}</span>${st.plus != null ? ` <span class="plus">+${st.plus}</span> <span class="minus">−${st.minus}</span>` : ''}</li>`)
             .join('')}</ul>`;
         if (s.final) h += `<p class="small final">💬 ${esc(s.final)}</p>`;
         h += '</div>';
@@ -1353,6 +1361,99 @@ class App {
       <div class="row"><input id="set-local-url" value="${esc(l.url)}" placeholder="http://127.0.0.1:11434"><button class="pill small" data-act="local-check">Проверить</button></div>
       ${this.localModels.length ? `<div class="row">${this.localModels.map((m) => `<button class="pill small ${m === l.model ? '' : 'ghost'}" data-act="local-model" data-id="${esc(m)}">${esc(m)}</button>`).join('')}</div>` : l.model ? `<p class="muted small">Модель: <b>${esc(l.model)}</b></p>` : ''}
       <label class="toggle"><input type="checkbox" id="set-local-on" ${l.on ? 'checked' : ''} ${l.model ? '' : 'disabled'}> Думать этим сервером${this.brain.ready ? ' (встроенный мозг — запасной)' : ''}</label></div>`;
+  }
+
+  // ---------------- Кто рядом (другие Туки в сети) ----------------
+
+  nearLook(): { name: string; hood: string; outfit: string } {
+    const st = this.store.data.settings;
+    return { name: cleanName(st.nearName || st.name), hood: st.hoodColor ?? 'Чёрный', outfit: this.char.outfit };
+  }
+
+  /** Включить/выключить по настройке (и обновить имя/наряд). Выключено по умолчанию. */
+  async startNearby(): Promise<void> {
+    if (!Nearby.available()) return;
+    if (!this.store.data.settings.nearby) return this.nearby.on ? this.nearby.stop() : undefined;
+    this.nearby.onChange = () => {
+      this.nearStrip.render(this.nearby.list.list);
+      if (this.tab === 'settings' && this.setSec === 'link') {
+        this.lastHtml = '';
+        this.render();
+      }
+    };
+    this.nearby.onEvent = (e) => this.onNear(e.type, e.peer);
+    try {
+      await this.nearby.start(this.nearLook());
+    } catch (e) {
+      this.say('Не получилось показаться рядом: ' + String((e as Error).message ?? e), 'think', 5000);
+    }
+  }
+
+  onNear(type: 'new' | 'hi' | 'bye', peer: NearPeer): void {
+    if (type === 'new') {
+      this.say(`Рядом ${peer.name}!`, 'meet', 3500);
+      this.sfx('message');
+    } else if (type === 'hi') {
+      this.say(`${peer.name} машет вам 👋`, 'wave', 2500);
+      requestAnimationFrame(() => this.nearStrip.animate(peer, 'wave'));
+      this.sfx('message');
+    }
+  }
+
+  async greetNear(id: string): Promise<void> {
+    const peer = this.nearby.list.peers.get(id);
+    if (!peer) return;
+    try {
+      if (!(await this.nearby.greet(id, this.nearLook()))) return;
+      this.flash('wave', 2500);
+      this.nearStrip.animate(peer, 'happy');
+    } catch (e) {
+      this.say('Привет не ушёл: ' + String((e as Error).message ?? e), 'think', 3000);
+    }
+  }
+
+  // ---------------- Codex / Gemini CLI, правки и терминал ----------------
+
+  async checkAgentHooks(): Promise<void> {
+    if (P.kind !== 'desktop') return;
+    for (const a of ['codex', 'gemini'] as HookAgent[]) this.agentHooks[a] = agentHooksInstalled(a, await agentConfig(a).catch(() => ''));
+  }
+
+  async setAgentHooks(agent: HookAgent, on: boolean): Promise<void> {
+    const info = AGENT_HOOK_INFO[agent];
+    try {
+      const exe = (await P.claudeInfo())?.exe;
+      if (!exe) return;
+      const cur = await agentConfig(agent);
+      await agentConfig(agent, on ? installAgentHooks(agent, cur, exe) : uninstallAgentHooks(agent, cur));
+      this.agentHooks[agent] = on;
+      this.say(on ? `Подключил ${info.name}. ${info.note}` : `Отключил ${info.name}. Остальные настройки не тронуты.`, on ? 'happy' : 'idle', 7000);
+      this.sfx(on ? 'link' : 'poke');
+    } catch (e) {
+      this.sfx('error');
+      this.say(`Не получилось изменить ${info.file}: ` + String((e as Error).message ?? e), 'think', 6000);
+    }
+    this.lastHtml = '';
+    this.render();
+  }
+
+  /** Полная правка шага по клику. */
+  showDiff(sessionId: string, index: number): void {
+    const st = this.agentHub.step(sessionId, index);
+    if (!st?.diff) return;
+    const ov = $('#overlay');
+    ov.innerHTML = `<div class="sheet diff-sheet"><h2>Правка · ${esc(st.text)}</h2>${diffHtml(st.diff)}<div class="row"><button class="pill" data-act="overlay-close">Закрыть</button></div></div>`;
+    ov.hidden = false;
+  }
+
+  async gotoTerminal(sessionId: string): Promise<void> {
+    const s = this.agentHub.sessions.get(sessionId);
+    if (!s) return;
+    try {
+      if ((await focusTerminal(s)) === 'folder') this.say('Окно терминала не нашёл — открыл папку проекта.', 'think', 3500);
+    } catch (e) {
+      this.say(String((e as Error).message ?? e), 'think', 3500);
+    }
   }
 
   // ---------------- Горячие клавиши ----------------
@@ -2180,6 +2281,12 @@ class App {
       else if (t.id === 'set-dance') st.dance = t.checked;
       else if (t.id === 'set-voiceloop') st.voiceLoop = t.checked;
       else if (t.id === 'set-agentclean') st.agentAutoClean = t.checked;
+      else if (t.id === 'set-nearby' || t.id === 'set-nearname') {
+        if (t.id === 'set-nearby') st.nearby = t.checked;
+        else st.nearName = t.value.trim().slice(0, 24);
+        void this.startNearby();
+        this.lastHtml = '';
+      }
       else if (t.id === 'set-local-on' || t.id === 'set-local-url' || t.id === 'set-local-model') {
         const l = (st.localAi ??= { on: false, url: LOCAL_PRESETS[0].url, model: '' });
         if (t.id === 'set-local-on') l.on = t.checked;
@@ -2434,6 +2541,19 @@ class App {
         break;
       case 'claude-on':
         await this.setClaudeHooks(true);
+        break;
+      case 'agent-hooks-on':
+      case 'agent-hooks-off':
+        await this.setAgentHooks(id as HookAgent, act === 'agent-hooks-on');
+        break;
+      case 'agent-diff':
+        this.showDiff(id, +(el.dataset.i ?? -1));
+        break;
+      case 'agent-term':
+        await this.gotoTerminal(id);
+        break;
+      case 'near-hi':
+        await this.greetNear(id);
         break;
       case 'claude-off':
         await this.setClaudeHooks(false);
@@ -2756,7 +2876,7 @@ class App {
       case 'main': body = this.setMainHtml(); break;
       case 'look': body = this.setLookHtml(); break;
       case 'brain': body = `<h3>Встроенный мозг</h3>${this.brainHtml(true)}${P.kind !== 'android' ? this.localHtml() : ''}`; break;
-      case 'link': body = this.setLinkHtml(); break;
+      case 'link': body = this.setLinkHtml() + nearSettingsHtml(!!this.store.data.settings.nearby, this.store.data.settings.nearName ?? '', this.nearby.list.list, Nearby.available()); break;
       case 'agents': body = this.setAgentsHtml(); break;
       case 'device': body = this.setDeviceHtml(); break;
       case 'help': body = this.setHelpHtml(); break;
@@ -2829,7 +2949,10 @@ class App {
       <div class="row">${this.claudeHooks ? '<button class="pill ghost small" data-act="claude-off">Отключить</button>' : '<button class="pill small" data-act="claude-on">Подключить Claude Code</button>'}<button class="pill ghost small" data-act="tab" data-id="agents">Открыть вкладку «Агенты»</button></div>
       <p class="muted small">Тук добавит свои хуки в ~/.claude/settings.json и сохранит копию файла. Ваши настройки не меняются.</p></div>
       <label class="toggle"><input type="checkbox" id="set-agentclean" ${st.agentAutoClean !== false ? 'checked' : ''}> Убирать закончившие сессии через 30 мин и молчащие — через час</label>
-      <p class="muted small">Другие агенты (Codex, Gemini CLI…) появляются своей пилюлей, если их хук добавляет в событие поле <code>"tuk_agent": "codex"</code> и вызывает <code>Tuk.exe --hook</code>.</p>`;
+      ${(['codex', 'gemini'] as HookAgent[]).map((a) => `<div class="card"><b>${AGENT_HOOK_INFO[a].name}</b> <span class="muted small">${this.agentHooks[a] ? 'подключён' : AGENT_HOOK_INFO[a].file}</span>
+        <div class="row">${this.agentHooks[a] ? `<button class="pill ghost small" data-act="agent-hooks-off" data-id="${a}">Отключить</button>` : `<button class="pill small" data-act="agent-hooks-on" data-id="${a}">Подключить ${AGENT_HOOK_INFO[a].name}</button>`}</div>
+        ${this.agentHooks[a] ? `<p class="muted small">${AGENT_HOOK_INFO[a].note}</p>` : ''}</div>`).join('')}
+      <p class="muted small">Любой другой агент появится своей пилюлей, если его хук вызывает <code>Tuk.exe --hook --agent имя</code>.</p>`;
     else h += `<p class="muted">${this.link.linked ? 'Сессии Claude Code с ПК видны во вкладке «Агенты». Разрешение подтверждается отпечатком пальца.' : 'Свяжите телефон с ПК (раздел «Связь») — и сможете разрешать действия Claude Code и отвечать на его вопросы с телефона.'}</p>`;
     const rules = this.store.data.agentRules ?? [];
     if (rules.length)

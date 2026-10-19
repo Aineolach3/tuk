@@ -446,3 +446,29 @@ kbd { font: 600 11.5px ui-monospace, Consolas, monospace; background: var(--card
 .steps-dots { display: flex; gap: 6px; justify-content: center; }
 .steps-dots i { width: 7px; height: 7px; border-radius: 4px; background: var(--line); transition: width 0.3s var(--spring), background 0.2s; }
 .steps-dots i.on { width: 20px; background: var(--accent); }
+
+/* ---- Временные стили программиста функций (diff правки, «кто рядом») — дизайнеру на переоформление ---- */
+.steps li.has-diff { cursor: pointer; border-radius: 6px; }
+.steps li.has-diff:hover { background: var(--card2); }
+#overlay .sheet.diff-sheet { max-width: 760px; align-items: stretch; }
+.diff { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.diff + .diff { margin-top: 8px; }
+.diff-h { display: flex; gap: 8px; align-items: baseline; padding: 6px 10px; background: var(--card2); font-size: 13px; }
+.diff-path { margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; direction: rtl; }
+.diff-b { overflow: auto; max-height: 60vh; }
+.diff table { border-collapse: collapse; width: 100%; font: 12px/1.45 ui-monospace, Consolas, monospace; }
+.diff td { padding: 0 6px; vertical-align: top; }
+.diff .dl-n { width: 1%; text-align: right; color: var(--muted); user-select: none; }
+.diff .dl-m { width: 1%; user-select: none; }
+.diff .dl-s { white-space: pre-wrap; word-break: break-all; }
+.diff .dl-add { background: rgba(108, 196, 106, 0.16); }
+.diff .dl-add .dl-m { color: #6cc46a; }
+.diff .dl-del { background: rgba(255, 107, 107, 0.16); }
+.diff .dl-del .dl-m { color: #ff6b6b; }
+.diff .dl-gap td { color: var(--muted); background: var(--card2); text-align: center; font-style: italic; }
+#near-strip { display: flex; gap: 4px; align-items: flex-end; flex: none; }
+#near-strip .near { border: 0; background: transparent; padding: 0; display: flex; flex-direction: column; align-items: center; color: var(--muted); font-size: 9px; max-width: 46px; cursor: pointer; }
+#near-strip .near canvas { width: 28px; height: 34px; }
+#near-strip .near span { max-width: 46px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#near-strip .near-more { font-size: 11px; color: var(--muted); }
+html.desktop:is(.island-hidden, .mode-collapsed) #near-strip span { display: none; }

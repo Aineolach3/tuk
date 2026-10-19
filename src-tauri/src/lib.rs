@@ -185,14 +185,33 @@ pub fn hook_main() -> i32 {
     let _ = std::io::stdin().read_to_string(&mut input);
     let blocking = input.contains("\"PermissionRequest\"");
     let read_secs = if blocking { 115 } else { 3 };
+    // метки Тука: агент (--agent codex|gemini), событие из командной строки и
+    // процессы-предки с окном консоли — чтобы потом поднять окно терминала сессии
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[allow(unused_mut)]
+    let mut origin: Vec<(&'static str, String)> = Vec::new();
+    #[cfg(windows)]
+    {
+        let (pids, console) = win32::hook_origin();
+        let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+        origin.push(("tuk_pids", format!("[{list}]")));
+        origin.push(("tuk_console", console.to_string()));
+    }
+    let input = net::hook_prepare(&input, &args, origin);
+    let mut out = std::io::stdout();
+    let mut printed = false;
     if let Ok(body) = net::http_post_t("127.0.0.1", 47800, "/hook", &input, 1, read_secs) {
         let t = body.trim();
         if t.starts_with('{') {
-            let mut out = std::io::stdout();
             let _ = out.write_all(t.as_bytes());
-            let _ = out.flush();
+            printed = true;
         }
     }
+    // Gemini CLI ждёт JSON на каждое событие; пустой объект — «без мнения»
+    if !printed && net::hook_args(&args).0 == "gemini" {
+        let _ = out.write_all(b"{}");
+    }
+    let _ = out.flush();
     0
 }
 
@@ -219,6 +238,33 @@ fn claude_write(json: String) -> Result<String, String> {
     #[cfg(mobile)]
     {
         let _ = json;
+        Err("Только на ПК".into())
+    }
+}
+
+/// Хуки Codex CLI / Gemini CLI (и Claude Code): прочитать и записать их файл настроек.
+#[tauri::command]
+fn agent_config(agent: String, json: Option<String>) -> Result<String, String> {
+    #[cfg(desktop)]
+    return match json {
+        Some(j) => desktop::agent_config_write(&agent, &j),
+        None => desktop::agent_config_read(&agent),
+    };
+    #[cfg(mobile)]
+    {
+        let _ = (agent, json);
+        Err("Только на ПК".into())
+    }
+}
+
+/// Перейти в окно терминала сессии агента (или открыть папку проекта).
+#[tauri::command]
+fn focus_terminal(pids: Vec<u32>, console: i64, cwd: String) -> Result<String, String> {
+    #[cfg(desktop)]
+    return desktop::focus_terminal(pids, console, cwd);
+    #[cfg(mobile)]
+    {
+        let _ = (pids, console, cwd);
         Err("Только на ПК".into())
     }
 }
@@ -415,6 +461,27 @@ async fn http_post(host: String, port: u16, path: String, body: String) -> Resul
         .map_err(err)?
 }
 
+/// «Кто рядом»: включить (packet — свой пакет `here`) или выключить (packet = None).
+/// Пакеты других Туков приходят событием `nearby` (JSON) во все окна приложения.
+#[tauri::command]
+fn nearby_set(app: AppHandle, packet: Option<String>) -> Result<(), String> {
+    match packet {
+        Some(p) => net::near_start(p, move |json| {
+            let _ = app.emit("nearby", json);
+        }),
+        None => {
+            net::near_stop();
+            Ok(())
+        }
+    }
+}
+
+/// «Привет» другому Туку (пакет `hi`).
+#[tauri::command]
+fn nearby_send(packet: String) -> Result<(), String> {
+    net::near_send(&packet)
+}
+
 #[tauri::command]
 async fn discover(ms: u64) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || net::discover(ms.min(10_000)))
@@ -490,6 +557,10 @@ pub fn run() {
             server_reply,
             http_post,
             discover,
+            nearby_set,
+            nearby_send,
+            agent_config,
+            focus_terminal,
             claude_info,
             claude_read,
             claude_write,

@@ -46,6 +46,8 @@ export interface Settings {
   localAi?: import('./localai.js').LocalAi; // мозг из Ollama / LM Studio на этом ПК или в домашней сети
   agentAutoClean?: boolean; // убирать закончившие и зависшие сессии сами (по умолчанию да)
   islandScreen?: 'primary' | 'cursor'; // ПК: остров на основном экране или на том, где мышь
+  nearby?: boolean; // «Показываться рядом» другим Тукам в сети (по умолчанию нет)
+  nearName?: string; // имя, которое видят соседи
 }
 
 export interface Data {
