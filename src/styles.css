@@ -10,6 +10,9 @@
   --green: #6cc46a;
   --warn: #ff6b5b;
   --radius: 14px;
+  --island: #0e0d12;
+  /* пружина ζ≈0.62, отклик 0.42 с — тот же характер, что у пружин персонажа */
+  --spring: cubic-bezier(0.2, 0.9, 0.3, 1.15);
   font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   color: var(--text);
   -webkit-tap-highlight-color: transparent;
@@ -17,6 +20,13 @@
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
 body { background: var(--bg); overflow: hidden; }
+/* Тёмная схема — только для самого интерфейса. На корне она заставляет WebView
+   залить прозрачное окно тёмным фоном — отсюда «тёмный прямоугольник» на столе. */
+html.desktop, html.pet { color-scheme: normal; }
+html.android, html.web, #shell, #overlay { color-scheme: dark; }
+@supports (animation-timing-function: linear(0, 1)) {
+  :root { --spring: linear(0, 0.032, 0.114, 0.227, 0.356, 0.487, 0.612, 0.726, 0.824, 0.905, 0.969, 1.016, 1.05, 1.07, 1.081, 1.083, 1.08, 1.073, 1.063, 1.053, 1.042, 1.031, 1.022, 1.014, 1.007, 1); }
+}
 button { font: inherit; color: inherit; cursor: pointer; }
 input { font: inherit; color: inherit; }
 
@@ -28,48 +38,86 @@ input { font: inherit; color: inherit; }
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 6px 12px 6px 6px;
-  height: 72px;
+  padding: 4px 12px 4px 4px;
+  height: 80px;
   user-select: none;
   position: relative;
 }
-#char { width: 64px; height: 60px; flex: none; }
+/* персонаж крупнее: холст во всю высоту строки, рисунок вписывается сам */
+#char { width: 84px; height: 76px; flex: none; cursor: pointer; touch-action: none; }
 #bar-text { flex: 1; min-width: 0; font-size: 14px; line-height: 1.3; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 #bar-text b { font-weight: 600; }
 #bar-actions { display: flex; gap: 6px; flex: none; }
-#gear { flex: none; border: 0; background: transparent; color: var(--muted); font-size: 20px; width: 40px; height: 40px; border-radius: 20px; }
+#gear { flex: none; border: 0; background: transparent; color: var(--muted); font-size: 20px; width: 40px; height: 40px; border-radius: 20px; transition: background 0.15s, color 0.15s; }
 #gear:hover { background: var(--card2); color: var(--text); }
-html.desktop.mode-collapsed #gear, html.desktop.mode-compact #gear { display: none; }
-#bar-badge { position: absolute; top: 4px; left: 58px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--warn); color: #fff; font-size: 11px; font-weight: 700; display: none; align-items: center; justify-content: center; }
-#bar-badge.show { display: flex; }
+#bar-badge { position: absolute; top: 6px; left: 70px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--warn); color: #fff; font-size: 11px; font-weight: 700; display: none; align-items: center; justify-content: center; box-shadow: 0 0 0 2px var(--island); }
+#bar-badge.show { display: flex; animation: badgein 0.42s var(--spring); }
+@keyframes badgein { from { transform: scale(0); } to { transform: none; } }
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
 
-/* ---------- ПК: строка у верхнего края экрана ---------- */
-html.desktop, html.desktop body { background: transparent; }
-html.desktop #shell { border-radius: 0 0 22px 22px; overflow: hidden; box-shadow: inset 0 -1px 0 rgba(255,255,255,0.06); }
-html.desktop.mode-collapsed #panel, html.desktop.mode-compact #panel { display: none; }
-html.desktop.mode-collapsed #bar { height: 100%; padding: 0 12px 0 4px; gap: 4px; justify-content: center; }
-html.desktop.mode-collapsed #char { width: 46px; height: 40px; }
-html.desktop.mode-collapsed #bar-text { flex: none; font-size: 12px; }
-html.desktop.mode-collapsed #bar-badge { top: 2px; left: 36px; }
-html.desktop.mode-compact #bar { height: 100%; }
-html.desktop.mode-expanded #bar { border-bottom: 1px solid var(--line); }
+/* ---------- ПК: остров у верхнего края экрана ----------
+   Окно всегда прозрачное: фон рисует только капсула (#shell), вокруг неё — пусто
+   (Rust делает это место click-through). Состояния острова:
+     island-hidden ≡ mode-collapsed — маленькая пилюля с головой Тука;
+     island-peek   ≡ mode-compact   — пилюля пошире: Тук и строка ответа;
+     island-home   ≡ mode-expanded  — раскрытая панель.
+   Переходы — только transform/clip-path/opacity (без пересчёта раскладки), кривая — пружина. */
+html.desktop, html.desktop body { background: transparent !important; }
+html.desktop #shell {
+  position: absolute;
+  inset: var(--edge) var(--gap) var(--gap);
+  height: auto;
+  background: var(--island);
+  border-radius: 999px;
+  box-shadow: 0 10px 28px -6px rgba(0,0,0,0.55), 0 2px 6px rgba(0,0,0,0.35), inset 0 0 0 1px rgba(255,255,255,0.07);
+  overflow: hidden;
+  transform-origin: 50% 0;
+  will-change: transform, clip-path;
+  --edge: 3px;
+  --gap: 5px;
+}
+html.desktop:is(.island-hidden, .mode-collapsed, .island-peek, .mode-compact) #panel { display: none; }
+html.desktop:is(.island-hidden, .mode-collapsed, .island-peek, .mode-compact) #gear { display: none; }
+
+/* hidden: капсула-«чёлка», крупно голова Тука */
+html.desktop:is(.island-hidden, .mode-collapsed) #shell { --gap: 3px; animation: island-hide 0.5s var(--spring) both; }
+html.desktop:is(.island-hidden, .mode-collapsed) #bar { height: 100%; padding: 0 14px 0 2px; gap: 4px; justify-content: center; }
+html.desktop:is(.island-hidden, .mode-collapsed) #char { width: 50px; height: 100%; }
+html.desktop:is(.island-hidden, .mode-collapsed) #bar-text { flex: none; font-size: 12px; -webkit-line-clamp: 1; }
+html.desktop:is(.island-hidden, .mode-collapsed) #bar-badge { top: 1px; left: 38px; }
+
+/* peek: выглянул — пилюля пошире */
+html.desktop:is(.island-peek, .mode-compact) #shell { animation: island-peek 0.5s var(--spring) both; }
+html.desktop:is(.island-peek, .mode-compact) #bar { height: 100%; padding: 0 16px 0 4px; }
+html.desktop:is(.island-peek, .mode-compact) #char { width: 80px; height: 100%; }
+
+/* home: раскрытая панель */
+html.desktop:is(.island-home, .mode-expanded) #shell { --gap: 10px; border-radius: 26px; animation: island-open 0.56s var(--spring) both; }
+html.desktop:is(.island-home, .mode-expanded) #bar { border-bottom: 1px solid var(--line); }
+html.desktop:is(.island-home, .mode-expanded) #panel { animation: panel-in 0.36s 0.08s ease-out both; }
+html.desktop:is(.island-home, .mode-expanded) #gear { display: none; } /* ⚙ есть во вкладках */
 html.desktop #reply { display: none; }
-html.desktop.mode-expanded #reply.show { display: block; }
+html.desktop:is(.island-home, .mode-expanded) #reply.show { display: block; }
+
+@keyframes island-hide { from { transform: scale(1.12, 1.35); } to { transform: none; } }
+@keyframes island-peek { from { clip-path: inset(0 26% 18% 26% round 999px); transform: scaleY(0.85); } to { clip-path: inset(0 0 0 0 round 999px); transform: none; } }
+@keyframes island-open { from { clip-path: inset(0 9% 84% 9% round 26px); transform: translateY(-4px); } to { clip-path: inset(0 0 0 0 round 26px); transform: none; } }
+@keyframes panel-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
 
 /* ---------- Телефон и браузер: пилюля сверху, под камерой ---------- */
 html.android #shell, html.web #shell { padding-top: env(safe-area-inset-top, 0px); }
 html.android #bar, html.web #bar {
   margin: 8px auto 4px;
   width: min(92vw, 440px);
-  height: 64px;
-  background: #19181f;
+  height: 68px;
+  background: var(--island);
   border-radius: 32px;
   padding: 4px 10px 4px 4px;
-  box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+  box-shadow: 0 8px 26px -6px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(255,255,255,0.06);
 }
-html.android #char, html.web #char { width: 74px; height: 62px; margin: -4px -4px -4px -2px; }
+html.android #char, html.web #char { width: 84px; height: 68px; margin: -4px -6px -4px -2px; }
+html.android #bar-badge, html.web #bar-badge { left: 64px; }
 html.web #shell { max-width: 520px; margin: 0 auto; }
 
 /* ---------- Панель ---------- */
@@ -203,7 +251,9 @@ footer { flex: none; padding: 6px 14px calc(8px + env(safe-area-inset-bottom, 0p
 .link-status.syncing::before { background: var(--accent); }
 .link-status.error::before { background: var(--warn); }
 
-@media (prefers-reduced-motion: reduce) { #reply { animation: none; } }
+@media (prefers-reduced-motion: reduce) {
+  #reply, html.desktop #shell, html.desktop #panel, html.drop #shell, #bar-badge.show, #overlay .sheet { animation: none !important; }
+}
 
 /* ---------- Чат ---------- */
 .chat { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; }
@@ -255,9 +305,11 @@ footer { flex: none; padding: 6px 14px calc(8px + env(safe-area-inset-bottom, 0p
 .card.music .t { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card.music .m { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card.music .ctl { display: flex; gap: 4px; }
+/* питомец: окно ровно по персонажу, ничего, кроме холста */
 html.pet, html.pet body { background: transparent !important; overflow: hidden; }
-html.pet #shell, html.pet #overlay { display: none !important; }
-#petc { position: fixed; inset: 0; width: 100%; height: 100%; cursor: grab; }
+html.pet #shell, html.pet #overlay, html.pet #scrim { display: none !important; }
+#petc { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+#petc:active { cursor: grabbing; }
 
 /* ---------- Микрофон и голос ---------- */
 [hidden] { display: none !important; }
@@ -280,11 +332,11 @@ html.drop #shell {
   border-radius: 0 0 28px 28px;
   box-shadow: 0 18px 50px rgba(0,0,0,0.55);
   overflow: hidden;
-  animation: dropin 0.24s cubic-bezier(.2,.9,.3,1.2);
+  animation: dropin 0.46s var(--spring);
   transform-origin: 50% 0;
 }
 html.drop #bar { margin: 6px auto 0; width: calc(100% - 16px); height: 56px; box-shadow: none; background: #000; }
-html.drop #char { width: 64px; height: 54px; }
+html.drop #char { width: 76px; height: 56px; }
 html.drop #gear, html.drop footer, html.drop #tabs [data-tab="health"], html.drop #tabs [data-tab="notes"], html.drop #tabs [data-tab="agents"] { display: none; }
 html.drop #full { display: block; flex: none; border: 0; background: transparent; color: var(--muted); font-size: 20px; width: 40px; height: 40px; border-radius: 20px; }
 html.drop #panel { flex: 1 1 auto; min-height: 0; }
@@ -300,3 +352,97 @@ html.drop #tabs { justify-content: flex-start; gap: 6px; }
 .voice-opt.on { border-color: var(--accent); background: var(--card2); }
 .access { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; font-size: 13px; color: var(--muted); }
 .access b { color: var(--text); }
+
+/* ПК: затемнение листов (сводка, знакомство) — только внутри капсулы, не на весь прозрачный прямоугольник окна */
+html.desktop #overlay { inset: 3px 10px 10px; border-radius: 26px; }
+html.desktop:not(.island-home):not(.mode-expanded) #overlay { display: none; }
+#overlay:not([hidden]) .sheet { animation: sheet-in 0.48s var(--spring); }
+@keyframes sheet-in { from { opacity: 0; transform: translateY(10px) scale(0.96); } to { opacity: 1; transform: none; } }
+
+/* ---------- Вкладки: ⚙ — круглая иконка фиксированной ширины, внимание — точка ---------- */
+#tabs { align-items: center; }
+#tabs button { transition: background 0.15s, color 0.15s; }
+#tabs .tab-gear { flex: 0 0 32px; width: 32px; height: 32px; padding: 0; border-radius: 16px; font-size: 16px; line-height: 32px; margin-left: 2px; }
+#tabs button.attn { color: var(--accent); font-weight: 600; position: relative; }
+#tabs button.attn::after { content: ''; position: absolute; top: 3px; right: 3px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: attnpulse 1.6s ease-in-out infinite; }
+@keyframes attnpulse { 50% { transform: scale(0.6); opacity: 0.5; } }
+/* узкий остров: вкладки прокручиваются, ⚙ прижата справа и всегда видна */
+@media (max-width: 460px) {
+  #tabs { justify-content: flex-start; gap: 2px; padding-right: 44px; position: relative; }
+  #tabs button:not(.tab-gear) { flex: 0 0 auto; padding: 7px 9px; }
+  #tabs .tab-gear { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: var(--island); box-shadow: -10px 0 10px -2px var(--island); }
+  #tabs .tab-gear.on { background: var(--card2); }
+}
+
+/* ---------- Цветные точки, пилюли сессий агентов ---------- */
+.dotc { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--sc, var(--accent)); margin-right: 6px; vertical-align: 0; flex: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--sc, var(--accent)) 18%, transparent); }
+#bar-text .dotc { width: 8px; height: 8px; box-shadow: none; }
+.spills { display: flex; flex-direction: column; gap: 6px; }
+.spill {
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+  padding: 8px 12px 8px 10px; border-radius: 999px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--sc) 14%, var(--card)) 0%, var(--card) 55%);
+  border: 1px solid color-mix(in srgb, var(--sc) 35%, transparent);
+  color: var(--text); text-decoration: none; font-size: 13px;
+  transition: transform 0.2s var(--spring), border-color 0.15s;
+}
+.spill:hover { transform: translateY(-1px); border-color: color-mix(in srgb, var(--sc) 70%, transparent); }
+.spill > i { width: 10px; height: 10px; border-radius: 50%; background: var(--sc); flex: none; box-shadow: 0 0 8px color-mix(in srgb, var(--sc) 60%, transparent); }
+.spill.st-working > i { animation: spillpulse 1.2s ease-in-out infinite; }
+.spill.st-waiting { border-color: var(--sc); box-shadow: 0 0 0 1px var(--sc) inset; }
+.spill.st-waiting > i { animation: spillpulse 0.7s ease-in-out infinite; }
+.spill.st-stale, .spill.st-ended { opacity: 0.55; }
+.spill b { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.spill span { flex: 1; min-width: 0; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spill em { font-style: normal; flex: none; font-variant-numeric: tabular-nums; }
+@keyframes spillpulse { 50% { opacity: 0.35; transform: scale(0.75); } }
+.session h3 { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.session h3 .dotc { background: var(--sc); }
+.session h3 .x { margin-left: auto; border: 0; background: transparent; color: var(--muted); font-size: 18px; width: 28px; height: 28px; border-radius: 8px; }
+.session h3 .x:hover { background: var(--card2); color: var(--text); }
+.session .final { color: var(--text); background: var(--card); border-radius: 12px; padding: 8px 12px; }
+.st-error { color: var(--warn); } .st-stale { color: var(--muted); }
+
+/* ---------- Разрешения и вопросы агентов ---------- */
+.item.perm { border-left: 3px solid var(--sc, var(--accent)); background: color-mix(in srgb, var(--sc, var(--accent)) 6%, var(--card)); animation: pop 0.3s ease-out; }
+.item.perm .who { font-size: 12.5px; color: var(--muted); margin-bottom: 4px; display: flex; align-items: center; flex-wrap: wrap; gap: 2px; }
+.item.perm .who .dotc { background: var(--sc); }
+.item.perm code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; overflow-wrap: anywhere; background: var(--bg); border-radius: 6px; padding: 1px 5px; }
+.q { margin: 6px 0; }
+.opts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.opt { text-align: left; border: 1px solid var(--line); background: var(--bg); border-radius: 12px; padding: 8px 11px; display: flex; flex-direction: column; gap: 2px; font-size: 13px; transition: border-color 0.15s, background 0.15s; }
+.opt:hover { border-color: color-mix(in srgb, var(--sc, var(--accent)) 60%, transparent); }
+.opt span { color: var(--muted); font-size: 11.5px; }
+.opt.on { border-color: var(--sc, var(--accent)); background: var(--card2); box-shadow: 0 0 0 1px var(--sc, var(--accent)) inset; }
+
+/* ---------- Карточки файлов ---------- */
+.fcard { align-items: flex-start; }
+.fthumb { width: 52px; height: 52px; border-radius: 10px; object-fit: cover; flex: none; background: var(--card2); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06); }
+.ficon { display: flex; align-items: center; justify-content: center; font-size: 24px; }
+.warn-t { color: var(--accent) !important; }
+
+/* ---------- Разделы ⚙ ---------- */
+.setnav { display: flex; flex-wrap: wrap; gap: 4px; margin: 10px 0 2px; padding: 3px; background: var(--card); border-radius: 16px; }
+.setnav button { border: 0; background: transparent; color: var(--muted); border-radius: 13px; padding: 6px 11px; font-size: 12.5px; transition: background 0.15s, color 0.15s; }
+.setnav button:hover { color: var(--text); }
+.setnav button.on { background: var(--card2); color: var(--text); box-shadow: inset 0 0 0 1px var(--accent); }
+
+/* ---------- Демо, ссылки, клавиши, «что умею» ---------- */
+.demo-banner { border: 1px dashed color-mix(in srgb, var(--accent) 70%, transparent); margin-top: 10px; background: color-mix(in srgb, var(--accent) 6%, var(--card)); }
+.linkbtn { border: 0; background: none; color: var(--accent); padding: 0; text-decoration: underline; text-underline-offset: 2px; font-size: inherit; }
+kbd { font: 600 11.5px ui-monospace, Consolas, monospace; background: var(--card2); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 1px 5px; }
+.can { gap: 4px !important; }
+.can li { display: flex; flex-direction: column; background: var(--card); border-radius: 12px; padding: 8px 12px; font-size: 13px; }
+.can span { color: var(--muted); }
+.keys { border-collapse: collapse; font-size: 13px; }
+.keys td { padding: 4px 6px; vertical-align: top; }
+.keys td:first-child { white-space: nowrap; }
+
+/* ---------- Знакомство (3 экрана) ---------- */
+#overlay .sheet.onboard { background: var(--card); border-radius: 24px; padding: 20px 18px 14px; align-items: stretch; max-width: 400px; box-shadow: 0 20px 50px -10px rgba(0,0,0,0.6), inset 0 0 0 1px rgba(255,255,255,0.06); }
+.onboard h2 { margin: 4px 0; font-size: 19px; }
+.onboard p { font-size: 14px; line-height: 1.45; margin: 6px 0; }
+.onboard .nav { justify-content: flex-end; margin-top: 8px; }
+.steps-dots { display: flex; gap: 6px; justify-content: center; }
+.steps-dots i { width: 7px; height: 7px; border-radius: 4px; background: var(--line); transition: width 0.3s var(--spring), background 0.2s; }
+.steps-dots i.on { width: 20px; background: var(--accent); }

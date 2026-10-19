@@ -256,26 +256,26 @@ function poseOf(m: Mood, t: number, age: number, bpm: number): Pose {
     case 'sleep':
       p.y = 0.03;
       p.reach = 0.7;
-      p.camX = -0.22;
+      p.camX = 0.24;
       p.sway = 0.45;
       break;
     case 'listen':
       p.sy = 1.03; p.y = -0.03; p.armL = 0.6; p.armR = -0.6; p.look = [0, 0]; p.es = 1.12;
       p.sway = -0.1 + Math.sin(t * 6) * 0.05;
-      p.reach = 0.8; p.camX = 0.22;
+      p.reach = 0.8;
       break;
     case 'think':
       p.rot = Math.sin(t * 1.3) * 0.05;
       p.look = [0.5 + Math.cos(t * 2) * 0.3, -0.8];
       p.armL = 0.3; p.armR = 1.95 + Math.sin(t * 1.3) * 0.04; p.outR = 0.48; p.frontR = true;
-      p.reach = 0.82; p.camX = -0.22;
+      p.reach = 0.82; p.camX = -0.18;
       break;
     case 'write':
       p.rot = 0.06; p.look = [0.2, 0.9]; p.armL = -0.5; p.armR = 0.5;
       break;
     case 'happy': {
       const ph = frac(t * 2.2);
-      p.y = -Math.sin(ph * Math.PI) * 0.1;
+      p.y = -Math.sin(ph * Math.PI) * 0.06;
       const sq = Math.pow(1 - Math.sin(ph * Math.PI), 8) * 0.07;
       p.sy = 1 - sq; p.sx = 1 + sq;
       p.armL = 2.5 + Math.sin(t * 6) * 0.12; p.armR = -2.5 - Math.sin(t * 6) * 0.12;
@@ -292,7 +292,7 @@ function poseOf(m: Mood, t: number, age: number, bpm: number): Pose {
       p.sy = 1 - land; p.sx = 1 + land;
       p.armR = -2.2 + Math.sin(t * 9) * 0.3; p.look = [0, 0]; p.es = 1.14;
       p.sway = -0.1 + Math.sin(t * 6) * 0.06;
-      p.reach = 0.86; p.camX = 0.14;
+      p.reach = 0.86; p.camX = 0.1;
       break;
     }
     case 'meet':
@@ -330,14 +330,14 @@ function poseOf(m: Mood, t: number, age: number, bpm: number): Pose {
     case 'search':
       p.rot = 0.07 + Math.sin(t * 1.6) * 0.03; p.x = Math.sin(t * 1.6) * 0.04; p.look = [0.85, 0.35];
       p.armL = 0.35; p.armR = -0.55; p.frontR = true;
-      p.reach = 0.76; p.camX = 0.32;
+      p.reach = 0.76; p.camX = 0.33;
       break;
     case 'ready':
       p.y = Math.sin(t * 2) * 0.02; p.look = [0, 0.1]; p.armL = -0.55; p.armR = 0.55;
       break;
     case 'help':
       p.rot = -0.04; p.look = [-0.9, -0.1]; p.armL = 2.05 + Math.sin(t * 3) * 0.08; p.frontL = true;
-      p.reach = 0.74; p.camX = 0.38;
+      p.reach = 0.74; p.camX = 0.32;
       break;
     case 'carry':
       p.y = -Math.abs(Math.sin(t * 7)) * 0.06; p.rot = 0.05 + Math.sin(t * 7) * 0.025; p.look = [0.6, 0];
@@ -553,7 +553,7 @@ export class Character {
       case 'poke': if (!this.tweens.has('sy')) this.squash(); break; // питомец мог уже сплющиться сам
       case 'happy': this.jump(); break;
       case 'dizzy': this.anim('roll', [[TAU, 1100, Ease.inOut]], () => (this.chan.roll = 0)); break;
-      case 'alert': this.anim('hop', [[-0.28, 140, Ease.out], [0, 320, Ease.back]]); break;
+      case 'alert': this.anim('hop', [[-0.18, 140, Ease.out], [0, 320, Ease.back]]); break;
       case 'eat': this.gulp(); break;
       case 'write': this.anim('hop', [[-0.08, 120, Ease.out], [0, 200, Ease.back]]); break;
       case 'wave': this.anim('tilt', [[-0.08, 160, Ease.out], [0, 400, Ease.back]]); break;
@@ -598,7 +598,7 @@ export class Character {
   /** Радостный прыжок: присел, взлетел, приземлился со сплющиванием. */
   jump(): void {
     this.wake();
-    this.anim('hop', [[0, 90, Ease.lin], [-0.45, 230, Ease.out], [0, 210, Ease.in]]);
+    this.anim('hop', [[0, 90, Ease.lin], [-0.26, 220, Ease.out], [0, 200, Ease.in]]);
     this.anim('sy', [[0.84, 90, Ease.out], [1.12, 150, Ease.out], [1, 290, Ease.inOut], [0.84, 70, Ease.out], [1, 240, Ease.back]]);
     this.anim('sx', [[1.12, 90, Ease.out], [0.92, 150, Ease.out], [1, 290, Ease.inOut], [1.14, 70, Ease.out], [1, 240, Ease.back]], () => this.puff(4));
     this.antLag.vel -= 5;
@@ -947,7 +947,8 @@ export class Character {
   /** Размер единицы (полуширины капюшона) в пикселях холста для текущего кадрирования. */
   private targetU(): number {
     const W = this.canvas.width, H = this.canvas.height;
-    const full = Math.min(W / 2.15, H / 2.75);
+    // по высоте — запас ~0,2 единицы над антенной на прыжки и подскоки
+    const full = Math.min(W / 2.15, H / 2.9);
     const head = Math.min(W / 2.15, H / 2.0);
     return lerp(full, head, clamp(this.zoom.v, 0, 1));
   }
@@ -958,7 +959,7 @@ export class Character {
     const z = clamp(this.zoom.v, 0, 1);
     const u = this.targetU() * lerp(this.reach.v, 1, z * 0.6);
     const k = u / U;
-    return { ox: W / 2 - this.camX.v * u * (1 - z), oy: H / 2 + lerp(0.15, 0.5, z) * u, k };
+    return { ox: W / 2 + this.camX.v * u * (1 - z), oy: H / 2 + lerp(0.2, 0.5, z) * u, k };
   }
 
   private render() {

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ru" class="demo">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Тук · анимации</title>
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    /* Демо-страница аниматора: все настроения, наряды, реакции и размеры на одном экране. */
+    html.demo, html.demo body { height: auto; min-height: 100%; color-scheme: dark; }
+    html.demo body { overflow: auto; background: radial-gradient(1200px 600px at 30% -10%, #241f33 0%, var(--bg) 60%); padding: 16px; }
+    .wrap { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; }
+    @media (max-width: 860px) { .wrap { grid-template-columns: 1fr; } }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 14px 0 6px; font-weight: 600; }
+    .stage { background: var(--card); border-radius: 22px; position: relative; overflow: hidden; }
+    .stage.big canvas { display: block; width: 100%; height: 420px; }
+    .stage .hud { position: absolute; left: 12px; top: 10px; font: 12px ui-monospace, Consolas, monospace; color: var(--muted); }
+    .stage .mood { position: absolute; right: 14px; top: 10px; font-weight: 600; }
+    .sizes { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; margin-top: 12px; }
+    .sizes figure { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 11.5px; color: var(--muted); }
+    .pillbar { background: var(--island); border-radius: 999px; box-shadow: 0 10px 28px -6px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(255,255,255,0.07); display: flex; align-items: center; }
+    .pillbar span { font-size: 12px; padding-right: 14px; color: var(--text); }
+    .desk { margin-top: 12px; height: 220px; border-radius: 18px; position: relative; overflow: hidden;
+      background: linear-gradient(135deg, #2a4a6b, #6b4a7a 60%, #c27a5a); }
+    .desk p { position: absolute; left: 12px; bottom: 8px; margin: 0; font-size: 12px; color: rgba(255,255,255,0.8); }
+    #pet { position: absolute; width: 120px; height: 140px; left: 40px; top: 40px; touch-action: none; }
+    #pet canvas { width: 100%; height: 100%; display: block; cursor: grab; }
+    .side { display: flex; flex-direction: column; }
+    .grid { display: flex; flex-wrap: wrap; gap: 4px; }
+    .grid .pill { margin: 0; }
+    .grid .pill.on { background: var(--accent); color: var(--accent-ink); }
+    .row label { font-size: 13px; color: var(--muted); display: flex; gap: 6px; align-items: center; }
+    input[type=range] { accent-color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <main>
+      <h1>Тук — анимации</h1>
+      <p class="muted small">Наведите курсор на Тука — глаза растут и он моргает; клик — тычок, три клика подряд — голова кружится. Тука на «рабочем столе» можно перетаскивать: он летит с наклоном и приземляется.</p>
+      <div class="stage big"><canvas id="big"></canvas><div class="hud" id="hud"></div><div class="mood" id="moodname"></div></div>
+      <div class="sizes">
+        <figure><div class="pillbar" style="height:38px;width:150px"><canvas id="c-peek" style="width:50px;height:38px"></canvas><span>12:40</span></div>Остров: hidden (голова)</figure>
+        <figure><div class="pillbar" style="height:72px;width:300px"><canvas id="c-bar" style="width:84px;height:72px"></canvas><span>Записал: купить хлеб</span></div>Остров: peek / строка</figure>
+        <figure><canvas id="c-wardrobe" style="width:80px;height:70px;background:var(--card);border-radius:12px"></canvas>Превью гардероба</figure>
+      </div>
+      <div class="desk" id="desk"><div id="pet"><canvas id="c-pet"></canvas></div><p>«Рабочий стол»: перетащите Тука</p></div>
+    </main>
+    <aside class="side">
+      <h2>Настроение</h2>
+      <div class="grid" id="moods"></div>
+      <div class="row"><button class="pill small" id="cycle">▶ Все по очереди (1,6 с)</button></div>
+      <h2>Реакции</h2>
+      <div class="grid">
+        <button class="pill ghost small" data-r="poke">Тычок</button>
+        <button class="pill ghost small" data-r="poke3">Три тычка</button>
+        <button class="pill ghost small" data-r="done">Готово — прыжок</button>
+        <button class="pill ghost small" data-r="alert">Тревога</button>
+        <button class="pill ghost small" data-r="eat">Глотает файл</button>
+        <button class="pill ghost small" data-r="blink">Моргнуть</button>
+        <button class="pill ghost small" data-r="land">Приземлиться</button>
+      </div>
+      <div class="row"><label>Танец, BPM <input type="range" id="bpm" min="70" max="160" value="112"> <b id="bpmv">112</b></label></div>
+      <h2>Наряд</h2>
+      <div class="grid" id="outfits"></div>
+      <h2>Капюшон</h2>
+      <div class="swatches" id="hoods"></div>
+      <h2>Огонёк в покое</h2>
+      <div class="swatches" id="lights"></div>
+      <h2>Звуки</h2>
+      <div class="grid" id="sounds"></div>
+      <div class="row"><label>Громкость <input type="range" id="vol" min="0" max="100" value="50"></label></div>
+      <h2>Экономия</h2>
+      <div class="row"><label><input type="checkbox" id="low"> Режим экономии (15 к/с)</label></div>
+    </aside>
+  </div>
+  <script type="module" src="demo.js"></script>
+</body>
+</html>

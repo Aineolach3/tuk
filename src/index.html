@@ -3,56 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-  <meta name="color-scheme" content="dark">
   <title>Тук</title>
   <link rel="stylesheet" href="styles.css">
-  <!-- Временные стили новых блоков (пилюли сессий, вопросы агентов, карточки файлов, разделы ⚙, знакомство).
-       Дизайнер может перенести их в styles.css и переоформить — см. docs/HANDOFF.md. -->
-  <style id="features-css">
-    .dotc { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--sc, var(--accent)); margin-right: 6px; vertical-align: 0; flex: none; }
-    #tabs button.attn { color: var(--accent); font-weight: 600; }
-    .setnav { display: flex; flex-wrap: wrap; gap: 4px; margin: 10px 0 2px; }
-    .setnav button { border: 1px solid var(--line); background: transparent; color: var(--muted); border-radius: 14px; padding: 5px 10px; font-size: 12.5px; }
-    .setnav button.on { background: var(--card2); color: var(--text); border-color: var(--accent); }
-    .spills { display: flex; flex-direction: column; gap: 6px; }
-    .spill { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 10px; border-radius: 18px; background: var(--card); border: 1px solid color-mix(in srgb, var(--sc) 45%, transparent); color: var(--text); text-decoration: none; font-size: 13px; }
-    .spill > i { width: 10px; height: 10px; border-radius: 50%; background: var(--sc); flex: none; }
-    .spill.st-working > i { animation: spillpulse 1.2s ease-in-out infinite; }
-    .spill.st-waiting { border-color: var(--sc); box-shadow: 0 0 0 1px var(--sc) inset; }
-    .spill.st-stale, .spill.st-ended { opacity: 0.6; }
-    .spill b { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .spill span { flex: 1; min-width: 0; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .spill em { font-style: normal; flex: none; }
-    @keyframes spillpulse { 50% { opacity: 0.35; } }
-    .session h3 { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-    .session h3 .dotc { background: var(--sc); }
-    .session h3 .x { margin-left: auto; border: 0; background: transparent; color: var(--muted); font-size: 18px; width: 28px; height: 28px; border-radius: 8px; }
-    .session .final { color: var(--text); background: var(--card); border-radius: 10px; padding: 6px 10px; }
-    .st-error { color: var(--warn); } .st-stale { color: var(--muted); }
-    .item.perm { border-left: 3px solid var(--sc, var(--accent)); }
-    .item.perm .who { font-size: 12.5px; color: var(--muted); margin-bottom: 4px; display: flex; align-items: center; flex-wrap: wrap; gap: 2px; }
-    .item.perm .who .dotc { background: var(--sc); }
-    .item.perm code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; overflow-wrap: anywhere; }
-    .q { margin: 6px 0; }
-    .opts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-    .opt { text-align: left; border: 1px solid var(--line); background: var(--bg); border-radius: 10px; padding: 7px 10px; display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
-    .opt span { color: var(--muted); font-size: 11.5px; }
-    .opt.on { border-color: var(--sc, var(--accent)); background: var(--card2); }
-    .fcard { align-items: flex-start; }
-    .fthumb { width: 52px; height: 52px; border-radius: 8px; object-fit: cover; flex: none; background: var(--card2); }
-    .ficon { display: flex; align-items: center; justify-content: center; font-size: 24px; }
-    .warn-t { color: var(--accent) !important; }
-    .demo-banner { border: 1px dashed var(--accent); margin-top: 10px; }
-    .linkbtn { border: 0; background: none; color: var(--accent); padding: 0; text-decoration: underline; font-size: inherit; }
-    kbd { font: 600 11.5px ui-monospace, Consolas, monospace; background: var(--card2); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 1px 5px; }
-    .can { gap: 4px !important; } .can li { display: flex; flex-direction: column; background: var(--card); border-radius: 10px; padding: 7px 10px; font-size: 13px; } .can span { color: var(--muted); }
-    #overlay .sheet.onboard { background: var(--card); border-radius: 22px; padding: 18px; align-items: stretch; max-width: 400px; }
-    .onboard h2 { margin: 4px 0; font-size: 19px; } .onboard p { font-size: 14px; line-height: 1.45; margin: 6px 0; }
-    .onboard .nav { justify-content: flex-end; }
-    .steps-dots { display: flex; gap: 6px; justify-content: center; } .steps-dots i { width: 7px; height: 7px; border-radius: 50%; background: var(--line); } .steps-dots i.on { background: var(--accent); }
-    .keys { border-collapse: collapse; font-size: 13px; } .keys td { padding: 4px 6px; vertical-align: top; } .keys td:first-child { white-space: nowrap; }
-    #bar-text .dotc { width: 8px; height: 8px; }
-  </style>
+  <!-- Класс платформы — до первой отрисовки: иначе прозрачное окно ПК на миг заливается тёмным фоном. -->
+  <script>if (window.__TAURI__ && !/android/i.test(navigator.userAgent)) document.documentElement.classList.add('desktop');</script>
 </head>
 <body>
   <div id="shell">
