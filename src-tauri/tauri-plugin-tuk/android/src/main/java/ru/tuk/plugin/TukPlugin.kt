@@ -108,7 +108,14 @@ class TukPlugin(private val activity: Activity) : Plugin(activity) {
         // прозрачный фон: в режиме выпадающего окна под ним видно приложение, из которого нажали на остров
         webView.setBackgroundColor(Color.TRANSPARENT)
         if (activity.intent?.getBooleanExtra("tuk_drop", false) == true) Island.drop = true
+        // без MulticastLock часть прошивок отбрасывает входящие UDP-broadcast («Кто рядом», поиск ПК)
+        try {
+            val wifi = activity.applicationContext.getSystemService(android.content.Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+            multicastLock = wifi.createMulticastLock("tuk-nearby").apply { setReferenceCounted(false); acquire() }
+        } catch (_: Exception) {}
     }
+
+    private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
