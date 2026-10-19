@@ -235,4 +235,93 @@ class Actions(private val activity: Activity) {
         }
         start(Intent(action))
     }
+
+    // ---------- Будильники и таймеры (официальные интенты «Часов») ----------
+
+    fun alarmControl(op: String) {
+        val action = when (op) {
+            "dismiss" -> AlarmClock.ACTION_DISMISS_ALARM
+            "snooze" -> AlarmClock.ACTION_SNOOZE_ALARM
+            "showTimers" -> if (Build.VERSION.SDK_INT >= 26) AlarmClock.ACTION_SHOW_TIMERS else AlarmClock.ACTION_SHOW_ALARMS
+            else -> AlarmClock.ACTION_SHOW_ALARMS
+        }
+        val i = Intent(action)
+        if (op == "dismiss" || op == "snooze") i.putExtra(AlarmClock.EXTRA_ALARM_SEARCH_MODE, AlarmClock.ALARM_SEARCH_MODE_ALL)
+        try {
+            activity.startActivity(i)
+        } catch (e: ActivityNotFoundException) {
+            // «Часы» не поддержали прямую команду — открываем список будильников
+            start(Intent(AlarmClock.ACTION_SHOW_ALARMS))
+        }
+    }
+
+    // ---------- Не беспокоить ----------
+
+    private fun notifManager() = activity.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+
+    fun canDnd(): Boolean = Build.VERSION.SDK_INT < 23 || notifManager().isNotificationPolicyAccessGranted
+
+    fun askDnd() {
+        start(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
+    }
+
+    fun dnd(on: Boolean): Boolean {
+        if (!canDnd()) return false
+        val nm = notifManager()
+        nm.setInterruptionFilter(
+            if (on) android.app.NotificationManager.INTERRUPTION_FILTER_PRIORITY
+            else android.app.NotificationManager.INTERRUPTION_FILTER_ALL
+        )
+        return true
+    }
+
+    // ---------- Режим звонка ----------
+
+    fun ringer(mode: String): Boolean {
+        val am = activity.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        // перевод в «беззвучно»/«вибро» требует доступа к «Не беспокоить» на части прошивок
+        if ((mode == "silent" || mode == "vibrate") && Build.VERSION.SDK_INT >= 23 && !canDnd()) return false
+        am.ringerMode = when (mode) {
+            "silent" -> AudioManager.RINGER_MODE_SILENT
+            "vibrate" -> AudioManager.RINGER_MODE_VIBRATE
+            else -> AudioManager.RINGER_MODE_NORMAL
+        }
+        return true
+    }
+
+    // ---------- Яркость и автоповорот (Settings.System, нужен WRITE_SETTINGS) ----------
+
+    fun canWriteSystem(): Boolean = Build.VERSION.SDK_INT < 23 || Settings.System.canWrite(activity)
+
+    fun askWriteSystem() {
+        val i = Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:" + activity.packageName))
+        try {
+            activity.startActivity(i)
+        } catch (e: ActivityNotFoundException) {
+            start(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS))
+        }
+    }
+
+    fun brightness(dir: String): Int {
+        val cr = activity.contentResolver
+        if (dir == "auto") {
+            Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC)
+            return -1
+        }
+        Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
+        val cur = Settings.System.getInt(cr, Settings.System.SCREEN_BRIGHTNESS, 128)
+        val next = when (dir) {
+            "max" -> 255
+            "min" -> 10
+            "up" -> (cur + 55).coerceAtMost(255)
+            else -> (cur - 55).coerceAtLeast(5)
+        }
+        Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS, next)
+        return next * 100 / 255
+    }
+
+    fun rotate(lock: Boolean): Boolean {
+        Settings.System.putInt(activity.contentResolver, Settings.System.ACCELEROMETER_ROTATION, if (lock) 0 else 1)
+        return true
+    }
 }

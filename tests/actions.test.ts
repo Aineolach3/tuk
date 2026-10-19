@@ -43,7 +43,7 @@ test('будильник и таймер', () => {
   assert.deepEqual(a('поставь будильник через 8 часов'), { kind: 'alarm', hour: 8, minute: 30 });
   assert.deepEqual(a('поставь таймер на пять минут'), { kind: 'timer', seconds: 300 });
   assert.deepEqual(a('засеки полчаса'), { kind: 'timer', seconds: 1800 });
-  assert.equal(a('выключи будильник'), null);
+  assert.deepEqual(a('выключи будильник'), { kind: 'alarmCtrl', op: 'dismiss' });
 });
 
 test('звонки и сообщения', () => {
@@ -123,4 +123,24 @@ test('приложения по названию', () => {
   assert.equal(pcTarget('сайт habr.com'), 'https://habr.com');
   assert.equal(pcTarget('диспетчер задач'), 'taskmgr');
   assert.equal(pcTarget('фотошоп'), null);
+});
+
+test('управление телефоном через официальные API', () => {
+  assert.deepEqual(a('стоп'), { kind: 'stop' });
+  assert.deepEqual(a('хватit' === 'хватit' ? 'хватит' : 'x'), { kind: 'stop' });
+  assert.deepEqual(a('выключи будильник'), { kind: 'alarmCtrl', op: 'dismiss' });
+  assert.deepEqual(a('отложи будильник'), { kind: 'alarmCtrl', op: 'snooze' });
+  assert.deepEqual(a('останови таймер'), { kind: 'alarmCtrl', op: 'showTimers' });
+  assert.deepEqual(a('покажи будильники'), { kind: 'alarmCtrl', op: 'showAlarms' });
+  assert.deepEqual(a('включи не беспокоить'), { kind: 'dnd', on: true });
+  assert.deepEqual(a('выключи режим не беспокоить'), { kind: 'dnd', on: false });
+  assert.deepEqual(a('поставь на беззвучный'), { kind: 'ringer', mode: 'silent' });
+  assert.deepEqual(a('поставь на вибрацию'), { kind: 'ringer', mode: 'vibrate' });
+  assert.deepEqual(a('включи звук звонка'), { kind: 'ringer', mode: 'normal' });
+  assert.deepEqual(a('прибавь яркость'), { kind: 'brightness', dir: 'up' });
+  assert.deepEqual(a('убавь яркость'), { kind: 'brightness', dir: 'down' });
+  assert.deepEqual(a('яркость на максимум'), { kind: 'brightness', dir: 'max' });
+  assert.deepEqual(a('сделай поярче'), { kind: 'brightness', dir: 'up' });
+  assert.deepEqual(a('включи автоповорот'), { kind: 'rotate', lock: false });
+  assert.deepEqual(a('отключи автоповорот'), { kind: 'rotate', lock: true });
 });

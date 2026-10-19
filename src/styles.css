@@ -298,3 +298,5 @@ html.drop #tabs { justify-content: flex-start; gap: 6px; }
 .voice-opt { text-align: left; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
 .voice-opt span { color: var(--muted); font-size: 12px; }
 .voice-opt.on { border-color: var(--accent); background: var(--card2); }
+.access { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; font-size: 13px; color: var(--muted); }
+.access b { color: var(--text); }

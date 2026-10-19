@@ -18,7 +18,13 @@ export type Action =
   | { kind: 'date' }
   | { kind: 'calendar'; title: string; at: number }
   | { kind: 'camera' }
-  | { kind: 'settings'; which: 'wifi' | 'bluetooth' | 'main' | 'display' | 'sound' | 'location' };
+  | { kind: 'settings'; which: 'wifi' | 'bluetooth' | 'main' | 'display' | 'sound' | 'location' }
+  | { kind: 'alarmCtrl'; op: 'dismiss' | 'snooze' | 'showAlarms' | 'showTimers' }
+  | { kind: 'dnd'; on: boolean }
+  | { kind: 'ringer'; mode: 'silent' | 'vibrate' | 'normal' }
+  | { kind: 'brightness'; dir: 'up' | 'down' | 'max' | 'min' | 'auto' }
+  | { kind: 'rotate'; lock: boolean }
+  | { kind: 'stop' };
 
 // ---------- Числа словами → цифры ----------
 
@@ -279,6 +285,43 @@ export function parseAction(input: string, now: Date = new Date()): Action | nul
   const raw = strip(clean(input));
   const s = raw.toLowerCase().replaceAll('ё', 'е');
   let m: RegExpMatchArray | null;
+
+  // стоп — оборвать речь, ответ, музыку
+  if (re('^(?:стоп|хватит|тихо|замолчи|помолчи|отмена|перестань|заткнись)$').test(s)) return { kind: 'stop' };
+
+  // управление будильником и таймером (через приложение «Часы»)
+  if (re('‹(?:будильник\\p{L}*|разбуди\\p{L}*)›').test(s) && re('‹(?:выключи|отключи|убери|сбрось|останови|отмени)›').test(s)) return { kind: 'alarmCtrl', op: 'dismiss' };
+  if (re('‹(?:отложи|поспать\\s+еще|еще\\s+поспать|подремать)›').test(s) && re('‹(?:будильник\\p{L}*|разбуди\\p{L}*)›|^отложи$').test(s)) return { kind: 'alarmCtrl', op: 'snooze' };
+  if (re('‹(?:таймер\\p{L}*)›').test(s) && re('‹(?:выключи|отключи|останови|сбрось|отмени|стоп)›').test(s)) return { kind: 'alarmCtrl', op: 'showTimers' };
+  if (re('‹(?:покажи|открой|мои|показать)›').test(s) && re('‹будильник\\p{L}*›').test(s)) return { kind: 'alarmCtrl', op: 'showAlarms' };
+  if (re('‹(?:покажи|открой|мои|показать)›').test(s) && re('‹таймер\\p{L}*›').test(s)) return { kind: 'alarmCtrl', op: 'showTimers' };
+
+  // не беспокоить
+  if (re('‹(?:не\\s+беспокоить|режим\\s+(?:сна|тишины)|ночной\\s+режим|тихий\\s+режим|дэнэдэ|dnd)›').test(s)) {
+    return { kind: 'dnd', on: !re('‹(?:выключи|отключи|убери|сними|отмени)›').test(s) };
+  }
+
+  // режим звонка
+  if (re('‹(?:беззвучн\\p{L}*|без\\s+звука)\\s*режим\\p{L}*›|‹(?:поставь|включи|переведи)\\s+(?:на\\s+)?беззвучн\\p{L}*›|‹режим\\s+без\\s+звука›').test(s)) return { kind: 'ringer', mode: 'silent' };
+  if (re('‹(?:режим\\s+)?вибрац\\p{L}*›|‹(?:поставь|включи|переведи)\\s+(?:на\\s+)?вибр\\p{L}*›|‹(?:на\\s+)?вибро›').test(s)) return { kind: 'ringer', mode: 'vibrate' };
+  if (re('‹(?:режим\\s+со\\s+звуком|включи\\s+звук\\s+звонка|обычный\\s+режим|со\\s+звуком)›').test(s)) return { kind: 'ringer', mode: 'normal' };
+
+  // яркость
+  if (re('‹яркост\\p{L}*›').test(s)) {
+    if (re('‹(?:авто|автоматическ\\p{L}*|адаптивн\\p{L}*)›').test(s)) return { kind: 'brightness', dir: 'auto' };
+    if (re('‹(?:на\\s+)?(?:максимум|полную|ярче\\s+всего)›|‹сделай\\s+ярче›|‹ярче›').test(s)) return { kind: 'brightness', dir: 'max' };
+    if (re('‹(?:на\\s+)?минимум›|‹темнее\\s+всего›').test(s)) return { kind: 'brightness', dir: 'min' };
+    if (re('‹(?:прибавь|добавь|подними|увеличь|побольше)›').test(s)) return { kind: 'brightness', dir: 'up' };
+    if (re('‹(?:убавь|уменьши|сбавь|темнее|поменьше|приглуши)›').test(s)) return { kind: 'brightness', dir: 'down' };
+  }
+  if (re('^(?:сделай\\s+)?(?:поярче|светлее)$').test(s)) return { kind: 'brightness', dir: 'up' };
+  if (re('^(?:сделай\\s+)?(?:потемнее|потусклее)$').test(s)) return { kind: 'brightness', dir: 'down' };
+
+  // автоповорот
+  if (re('‹(?:автоповорот\\p{L}*|поворот\\s+экрана|авто[\\s-]?поворот)›').test(s)) {
+    return { kind: 'rotate', lock: re('‹(?:выключи|отключи|убери|зафиксируй|заблокируй)›').test(s) };
+  }
+  if (re('‹(?:зафиксируй|заблокируй|закрепи)\\s+(?:экран|ориентацию|поворот)›').test(s)) return { kind: 'rotate', lock: true };
 
   // будильник
   if (re('‹(?:будильник\\p{L}*|разбуди(?:те)?|подними\\s+меня)›').test(s) && !re('‹(?:выключи|отключи|убери|удали)›').test(s)) {

@@ -95,6 +95,9 @@ class ActArgs {
     var begin: Long? = null
     var end: Long? = null
     var which: String? = null
+    var op: String? = null
+    var mode: String? = null
+    var lock: Boolean? = null
 }
 
 @TauriPlugin
@@ -491,6 +494,35 @@ class TukPlugin(private val activity: Activity) : Plugin(activity) {
                 "calendar" -> actions.calendar(a.title ?: "Событие", a.begin ?: System.currentTimeMillis(), a.end ?: ((a.begin ?: System.currentTimeMillis()) + 3_600_000))
                 "camera" -> actions.camera()
                 "settings" -> actions.settings(a.which ?: "main")
+                "alarmControl" -> actions.alarmControl(a.op ?: "showAlarms")
+                "dnd" -> {
+                    if (!actions.canDnd()) {
+                        actions.askDnd()
+                        r.put("needPerm", "dnd")
+                    } else r.put("ok", actions.dnd(a.on ?: true))
+                }
+                "ringer" -> {
+                    if (!actions.ringer(a.mode ?: "normal")) {
+                        actions.askDnd()
+                        r.put("needPerm", "dnd")
+                    } else r.put("ok", true)
+                }
+                "brightness" -> {
+                    if (!actions.canWriteSystem()) {
+                        actions.askWriteSystem()
+                        r.put("needPerm", "write")
+                    } else r.put("level", actions.brightness(a.dir ?: "up"))
+                }
+                "rotate" -> {
+                    if (!actions.canWriteSystem()) {
+                        actions.askWriteSystem()
+                        r.put("needPerm", "write")
+                    } else r.put("ok", actions.rotate(a.lock ?: false))
+                }
+                "canSystem" -> {
+                    r.put("dnd", actions.canDnd())
+                    r.put("write", actions.canWriteSystem())
+                }
                 else -> throw Exception("Неизвестное действие ${a.action}")
             }
             invoke.resolve(r)

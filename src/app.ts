@@ -18,6 +18,14 @@ import { matchApp, matchContacts, parseAction, pcTarget, wordsToDigits, type Act
 
 const VOICE_SAMPLE = 'Привет! Я Тук. Теперь я говорю вот так. Нравится?';
 
+/** Похоже ли на команду действию (а не на разговор/вопрос). */
+function looksLikeCommand(text: string): boolean {
+  const t = text.toLowerCase().replaceAll('ё', 'е').trim();
+  if (t.length > 90 || /\?$/.test(t)) return false;
+  // без \b — он не работает перед кириллицей
+  return /(будильник|таймер|позвон|набери|напиши|открой|запусти|включи|выключи|отключи|фонар|громкост|громче|тише|звук|яркост|поворот|беспокоить|вибрац|беззвучн|маршрут|навигатор|музык|трек|песн|камер|заряд|настройк|останови|поставь|сними|сделай|убавь|прибавь|погаси|зажги|позвони)/.test(t);
+}
+
 /** Кадры острова: настроение, число кадров, кадров в секунду. */
 const ISLAND_MOODS: [Mood, number, number][] = [
   ['idle', 24, 8], ['near', 20, 8], ['sleep', 20, 6], ['think', 20, 10], ['work', 16, 12], ['write', 16, 10],
@@ -157,6 +165,11 @@ class App {
           return;
         }
         await this.checkDrop();
+        if (this.tab === 'settings') {
+          await this.refreshAccess();
+          this.lastHtml = '';
+          this.render();
+        }
         if (this.awaitGrant) {
           this.awaitGrant = false;
           const c = await P.island('check').catch(() => null);
@@ -171,6 +184,7 @@ class App {
       });
       void this.startIsland();
       void this.refreshVoice();
+      void this.refreshAccess();
       if (!this.store.data.webCacheCleared) {
         // старый мозг лежал внутри WebView и съедал место — теперь он нативный
         void P.clearWebModelCache().then(() => {
@@ -315,6 +329,14 @@ class App {
     if (action) return this.runAction(action);
     // голосом числа приходят словами: «через пять минут» → «через 5 минут»
     if (this.voiceAsked) text = wordsToDigits(text).replace(/^./, (c) => c.toUpperCase());
+    // не узнали команду по правилам — пусть мозг поймёт свободную фразу («погаси свет на телефоне» → «выключи фонарик»)
+    if (this.voiceAsked && looksLikeCommand(text) && this.canTalk()) {
+      const canon = await this.brainToCommand(text).catch(() => null);
+      if (canon) {
+        const a2 = parseAction(canon);
+        if (a2) return this.runAction(a2);
+      }
+    }
     const p = parse(text);
     if (p.type === 'empty') return;
     const question = /\?\s*$/.test(text.trim());
@@ -1369,11 +1391,90 @@ class App {
           if (!android) return void (await P.openTarget('ms-settings:'));
           await P.act('settings', { which: a.which });
           return this.say('Открыл настройки.', 'carry', 2000);
+        case 'stop': {
+          this.voiceContinue = false;
+          await P.speakStop();
+          this.setVoice('off');
+          if (android) await P.act('media', { key: 'pause' }).catch(() => {});
+          else await P.mediaControl('toggle').catch(() => {});
+          return this.say('Остановил.', 'idle', 1800);
+        }
+        case 'alarmCtrl': {
+          if (!android) return this.say('Будильниками я управляю на телефоне.', 'think', 3500);
+          await P.act('alarmControl', { op: a.op });
+          const txt = a.op === 'dismiss' ? 'Выключаю будильник.' : a.op === 'snooze' ? 'Отложил будильник.' : a.op === 'showTimers' ? 'Открыл таймеры — остановите нужный.' : 'Вот ваши будильники.';
+          return this.say(txt, 'carry', 3500);
+        }
+        case 'dnd': {
+          if (!android) return this.say('«Не беспокоить» — это на телефоне.', 'think', 3000);
+          const r = await P.act('dnd', { on: a.on });
+          if (r?.needPerm) return this.say('Разрешите Туку управлять режимом «Не беспокоить» — я открыл нужный экран. Потом повторите команду.', 'ready', 7000);
+          return this.say(a.on ? 'Включил «Не беспокоить».' : 'Выключил «Не беспокоить».', 'ready', 2500);
+        }
+        case 'ringer': {
+          if (!android) return this.say('Режим звонка меняется на телефоне.', 'think', 3000);
+          const r = await P.act('ringer', { mode: a.mode });
+          if (r?.needPerm) return this.say('Для беззвучного режима разрешите доступ к «Не беспокоить» — я открыл экран. Потом повторите.', 'ready', 7000);
+          return this.say(a.mode === 'silent' ? 'Беззвучный режим.' : a.mode === 'vibrate' ? 'Режим вибрации.' : 'Звук звонка включён.', 'ready', 2500);
+        }
+        case 'brightness': {
+          if (!android) return this.say('Яркость экрана — это на телефоне.', 'think', 3000);
+          const r = await P.act('brightness', { dir: a.dir });
+          if (r?.needPerm) return this.say('Разрешите Туку менять системные настройки — я открыл нужный экран. Потом повторите команду.', 'ready', 7000);
+          return this.say(a.dir === 'auto' ? 'Яркость — автоматическая.' : `Яркость ${r?.level ?? ''}%.`, 'ready', 2500);
+        }
+        case 'rotate': {
+          if (!android) return this.say('Поворот экрана — это на телефоне.', 'think', 3000);
+          const r = await P.act('rotate', { lock: a.lock });
+          if (r?.needPerm) return this.say('Разрешите Туку менять системные настройки — я открыл экран. Потом повторите.', 'ready', 7000);
+          return this.say(a.lock ? 'Автоповорот выключен.' : 'Автоповорот включён.', 'ready', 2500);
+        }
       }
     } catch (e) {
       this.sfx('error');
       this.say('Не получилось: ' + String((e as Error).message ?? e), 'think', 5000);
     }
+  }
+
+  /** Мозг переводит свободную фразу в понятную Туку команду (или 'НЕТ'). */
+  async brainToCommand(text: string): Promise<string | null> {
+    const sys =
+      'Ты — помощник, который превращает фразу человека в одну короткую команду из списка. ' +
+      'Отвечай ТОЛЬКО командой с подставленными словами, без пояснений. Если фраза не подходит ни к одной — ответь «НЕТ».\n' +
+      'Команды-образцы:\n' +
+      'поставь будильник на 7:00 | отложи будильник | выключи будильник | поставь таймер на 5 минут | останови таймер | ' +
+      'позвони <имя> | напиши <имя> что <текст> | открой <приложение> | включи фонарик | выключи фонарик | ' +
+      'сделай громче | сделай тише | выключи звук | следующий трек | поставь на паузу | ' +
+      'яркость на максимум | убавь яркость | включи не беспокоить | выключи не беспокоить | поставь на вибрацию | ' +
+      'включи автоповорот | выключи автоповорот | проложи маршрут до <место> | найди в интернете <запрос> | ' +
+      'сколько заряда | который час | открой камеру';
+    const msgs: ChatMsg[] = [
+      { role: 'system', content: sys },
+      { role: 'user', content: `Фраза: «${text}»\nКоманда:` },
+    ];
+    let out = '';
+    await this.brain.chat(msgs, (full) => (out = full)).catch(() => {});
+    out = out.split('\n')[0].replace(/^(команда|ответ)\s*[:：]\s*/i, '').replace(/[«»"']/g, '').trim();
+    if (!out || /^нет\b/i.test(out) || out.length > 80) return null;
+    return out;
+  }
+
+  sysAccess: { dnd?: boolean; write?: boolean } | null = null;
+
+  async refreshAccess(): Promise<void> {
+    if (P.kind !== 'android') return;
+    this.sysAccess = await P.act('canSystem').catch(() => null);
+  }
+
+  commandHtml(): string {
+    if (P.kind !== 'android') return '';
+    const a = this.sysAccess;
+    const ok = (v?: boolean) => (v ? '✓ есть' : '— нет');
+    return `<h3>Управление телефоном</h3><div class="card">
+      <span class="muted">Тук выполняет команды голосом: будильник и таймер (поставить, отложить, выключить), звонок и сообщение, открыть приложение, фонарик, громкость и музыку, «Не беспокоить», режим звонка, яркость, автоповорот, маршрут, поиск. Скажите «стоп», чтобы он замолчал.</span>
+      <div class="access"><span>«Не беспокоить» и беззвучный режим: <b>${ok(a?.dnd)}</b></span><span>Яркость и автоповорот: <b>${ok(a?.write)}</b></span></div>
+      <div class="row"><button class="pill ghost small" data-act="grant-dnd">Разрешить «Не беспокоить»</button><button class="pill ghost small" data-act="grant-write">Разрешить настройки</button></div>
+      <p class="muted small">Эти два доступа Android выдаёт вручную. Без них всё остальное работает, а эти команды Тук попросит включить в нужный момент.</p></div>`;
   }
 
   // ---------------- Живой голос ----------------
@@ -1699,6 +1800,12 @@ class App {
         return this.toggleIsland(false);
       case 'set-voice':
         return this.chooseVoice(id);
+      case 'grant-dnd':
+        await P.act('dnd', { on: true }).catch(() => {});
+        return this.say('Открыл настройки «Не беспокоить» — включите доступ для Тука.', 'ready', 6000);
+      case 'grant-write':
+        await P.act('brightness', { dir: 'up' }).catch(() => {});
+        return this.say('Открыл системные настройки — разрешите Туку их менять.', 'ready', 6000);
       case 'voice-test':
         return void this.speakOut(VOICE_SAMPLE);
       case 'wake-on':
@@ -2075,6 +2182,7 @@ class App {
       <div class="card">${st.island && this.islandOn ? '<b>Включён.</b> <span class="muted">Тук живёт вверху экрана, вокруг камеры. Нажатие — выпадающее окно, долгое нажатие — всё приложение.</span>' : '<span class="muted">Маленький анимированный Тук вверху экрана поверх любых приложений. Нажали — открылось небольшое окно: голос, записи, дела на сегодня.</span>'}
       <div class="row">${st.island && this.islandOn ? '<button class="pill ghost small" data-act="island-off">Убрать</button>' : '<button class="pill small" data-act="island-on">Включить</button>'}</div>
       <p class="muted small">Нужно разрешение «Поверх других приложений». В шторке появится тихое уведомление «Тук рядом» — так Android не выгружает Тука.</p></div>
+      ${this.commandHtml()}
       ${this.voiceHtml()}
       ${this.wakeHtml()}
       <h3>Голос</h3>
