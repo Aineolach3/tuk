@@ -409,26 +409,36 @@ export async function island(action: string, args: IslandArgs = {}): Promise<any
 
 // ---------------- Голос ----------------
 
-/** Можно ли говорить с Туком голосом на этом устройстве. */
+/** Можно ли говорить с Туком голосом на этом устройстве (ПК — когда скачано распознавание). */
 export function canListen(): boolean {
-  return kind === 'android';
+  return kind === 'android' || (kind === 'desktop' && pcVoiceReady);
 }
 
-/** Распознать фразу (Android: системный распознаватель, по возможности офлайн). */
+/** Распознать фразу (Android: системный распознаватель; ПК: Vosk офлайн). */
 export async function hear(): Promise<string> {
-  if (kind !== 'android') throw new Error('Голосовой ввод на ПК появится в следующей версии');
+  if (kind === 'desktop') return pcHear();
+  if (kind !== 'android') throw new Error('Голосовой ввод доступен в приложении');
   const r = await invoke('plugin:tuk|listen', { action: 'start' });
   return String(r?.text ?? '');
 }
 
 /** Промежуточный текст, пока человек говорит. */
 export async function listenPartial(): Promise<{ text: string; listening: boolean }> {
+  if (kind === 'desktop') return { text: pcPartial, listening: !!pcHearWait };
   if (kind !== 'android') return { text: '', listening: false };
   return invoke('plugin:tuk|listen', { action: 'partial' });
 }
 
 export async function listenStop(cancel = false): Promise<void> {
   if (kind === 'android') await invoke('plugin:tuk|listen', { action: cancel ? 'cancel' : 'stop' });
+  else if (kind === 'desktop') {
+    if (cancel && pcHearWait) {
+      const w = pcHearWait;
+      pcHearWait = null;
+      w.fail(new Error('Отменено'));
+    }
+    await invoke('voice_listen', { action: cancel ? 'cancel' : 'stop' }).catch(() => {});
+  }
 }
 
 /** Произнести текст; промис завершается, когда Тук договорил. */
@@ -436,6 +446,14 @@ export async function speak(text: string, voicePreset?: string): Promise<void> {
   if (kind === 'android') {
     await invoke('plugin:tuk|speak', { text, voice: voicePreset || undefined });
     return;
+  }
+  // ПК: живой голос (sherpa-onnx), если он скачан; иначе — голос Windows через WebView
+  if (kind === 'desktop' && voicePreset) {
+    const done = await invoke('voice_speak', { text, preset: voicePreset }).catch((e: unknown) => {
+      console.warn('живой голос:', e);
+      return false;
+    });
+    if (done) return;
   }
   const ss = (globalThis as any).speechSynthesis as SpeechSynthesis | undefined;
   if (!ss) return;
@@ -453,7 +471,92 @@ export async function speak(text: string, voicePreset?: string): Promise<void> {
 
 export async function speakStop(): Promise<void> {
   if (kind === 'android') await invoke('plugin:tuk|speak', { stop: true }).catch(() => {});
-  else (globalThis as any).speechSynthesis?.cancel();
+  else {
+    if (kind === 'desktop') await invoke('voice_speak_stop').catch(() => {});
+    (globalThis as any).speechSynthesis?.cancel();
+  }
+}
+
+// ---------------- Голос на ПК: «Тук Тук» (Vosk) и живой голос (sherpa-onnx) ----------------
+
+/** Что знает Rust про голос на ПК (src-tauri/src/voice). */
+export interface PcVoiceStatus {
+  libs: boolean; // библиотеки есть в сборке
+  model: 'none' | 'downloading' | 'ready' | 'error'; // распознавание (~45 МБ)
+  voice: 'none' | 'downloading' | 'ready' | 'error'; // живой голос выбранного пресета (~67 МБ)
+  progress: number;
+  error?: string | null;
+  wake: boolean; // слушает «Тук Тук»
+  listening: boolean; // слушает команду
+}
+
+/** Событие от распознавания: услышал «Тук Тук», говорят, команда готова, тишина, ошибка. */
+export interface PcWakeEvent {
+  state: 'listen' | 'partial' | 'command' | 'idle' | 'error';
+  text: string;
+  manual: boolean; // ответ на 🎤, а не «Тук Тук»
+}
+
+let pcVoiceReady = false;
+let pcPartial = '';
+let pcHearWait: { ok: (t: string) => void; fail: (e: Error) => void } | null = null;
+let pcWakeCb: ((e: PcWakeEvent) => void) | null = null;
+let pcListening = false;
+
+export async function pcVoiceStatus(preset = 'tuk'): Promise<PcVoiceStatus | null> {
+  if (kind !== 'desktop') return null;
+  const st = (await invoke('voice_status', { preset }).catch(() => null)) as PcVoiceStatus | null;
+  pcVoiceReady = !!st?.libs && st.model === 'ready';
+  return st;
+}
+
+/** Скачать распознавание (`model`) или живой голос (`voice`). Прогресс — в pcVoiceStatus. */
+export async function pcVoiceDownload(what: 'model' | 'voice', preset = 'tuk'): Promise<void> {
+  await invoke('voice_download', { what, preset });
+}
+
+/** Включить или выключить постоянное слушание «Тук Тук». */
+export async function pcWake(on: boolean): Promise<void> {
+  await pcListenEvents();
+  await invoke('voice_wake', { on });
+}
+
+/** Подписка на «Тук Тук» (команды, сказанные без нажатия на 🎤). */
+export function onPcWake(cb: (e: PcWakeEvent) => void): void {
+  pcWakeCb = cb;
+  void pcListenEvents();
+}
+
+async function pcListenEvents(): Promise<void> {
+  if (pcListening || kind !== 'desktop') return;
+  pcListening = true;
+  await listen('voice-wake', (e: PcWakeEvent) => {
+    if (e.state === 'listen' || e.state === 'idle' || e.state === 'command') pcPartial = '';
+    if (e.state === 'partial') pcPartial = e.text;
+    // ответ на 🎤 — промису hear(), остальное — приложению
+    if (e.manual && pcHearWait) {
+      const w = pcHearWait;
+      if (e.state === 'command') (pcHearWait = null), w.ok(e.text);
+      else if (e.state === 'idle') (pcHearWait = null), w.ok('');
+      else if (e.state === 'error') (pcHearWait = null), w.fail(new Error(e.text));
+      return;
+    }
+    pcWakeCb?.(e);
+  });
+}
+
+async function pcHear(): Promise<string> {
+  await pcListenEvents();
+  pcHearWait?.fail(new Error('Отменено'));
+  pcPartial = '';
+  const p = new Promise<string>((ok, fail) => (pcHearWait = { ok, fail }));
+  try {
+    await invoke('voice_listen', { action: 'start' });
+  } catch (e) {
+    pcHearWait = null;
+    throw e instanceof Error ? e : new Error(String(e));
+  }
+  return p;
 }
 
 // ---------------- Нативный мозг, живой голос, действия (Android) ----------------
@@ -465,6 +568,13 @@ export async function llm(action: string, args: Record<string, unknown> = {}): P
 
 /** Живой голос: status | download (voice: tuk | bright | boy | calm). */
 export async function voice(action: string, preset: string): Promise<{ state: string; progress?: number; error?: string } | null> {
+  if (kind === 'desktop') {
+    // ПК: те же голоса piper-ru, синтез sherpa-onnx в Rust (src-tauri/src/voice)
+    if (action === 'download') await pcVoiceDownload('voice', preset);
+    const st = await pcVoiceStatus(preset);
+    if (!st?.libs) return null;
+    return { state: st.voice, progress: st.progress, error: st.error ?? undefined };
+  }
   if (kind !== 'android') return null;
   return invoke('plugin:tuk|voice', { action, voice: preset });
 }

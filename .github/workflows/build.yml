@@ -135,6 +135,38 @@ jobs:
       - name: Зависимости
         run: npm install
 
+      # «Тук Тук» и живой голос на ПК: распознавание Vosk и синтез sherpa-onnx — готовые DLL.
+      # Тук грузит их на лету (src-tauri/src/voice/win.rs); версии и отпечатки закреплены,
+      # раскладка структур sherpa-onnx в voice/ffi.rs сверена именно с v1.13.8.
+      - name: Голос для Windows (Vosk и sherpa-onnx)
+        shell: bash
+        run: |
+          set -euo pipefail
+          D=src-tauri/voice-libs
+          # относительные пути и tar.exe из Windows (bsdtar: и zip, и tar.bz2)
+          mkdir -p "$D" vl
+          curl -fsSL https://github.com/alphacep/vosk-api/releases/download/v0.3.45/vosk-win64-0.3.45.zip -o vl/vosk.zip
+          curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-v1.13.8-win-x64-shared-MT-Release.tar.bz2 -o vl/sherpa.tar.bz2
+          ( cd vl && sha256sum -c - ) <<'SUMS'
+          f1dcc9cca460630f81ea8f71794f69c80bed6556d2a4e6237b5785e1d2dff34b  vosk.zip
+          6dffdc715a4465b989446a6105265d2cb345e7101591a17d35534b6758f6e8df  sherpa.tar.bz2
+          SUMS
+          ( cd vl && /c/Windows/System32/tar.exe -xf vosk.zip && /c/Windows/System32/tar.exe -xf sherpa.tar.bz2 )
+          cp vl/vosk-win64-0.3.45/{libvosk.dll,libstdc++-6.dll,libgcc_s_seh-1.dll,libwinpthread-1.dll} "$D/"
+          cp vl/sherpa-onnx-v1.13.8-win-x64-shared-MT-Release/lib/{sherpa-onnx-c-api.dll,onnxruntime.dll} "$D/"
+          rm -rf vl
+          ls -la "$D"
+          # DLL — в ресурсы установщика (папка voice-libs рядом с Tuk.exe). tauri.windows.conf.json
+          # Tauri сам сливает с tauri.conf.json при сборке под Windows; в git его нет, чтобы
+          # локальная сборка без DLL не падала.
+          node -e '
+            const fs = require("fs");
+            const res = {};
+            for (const f of fs.readdirSync("src-tauri/voice-libs")) res["voice-libs/" + f] = "voice-libs/" + f;
+            fs.writeFileSync("src-tauri/tauri.windows.conf.json", JSON.stringify({ bundle: { resources: res } }, null, 2));
+          '
+          cat src-tauri/tauri.windows.conf.json
+
       - name: Сборка установщика
         run: npx tauri build --ci
 

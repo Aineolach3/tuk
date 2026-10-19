@@ -11,6 +11,7 @@ mod files;
 mod island;
 mod localhttp;
 mod net;
+mod voice;
 #[cfg(windows)]
 mod win32;
 
@@ -578,7 +579,13 @@ pub fn run() {
             files::read_text,
             localhttp::local_http,
             localhttp::local_http_stream,
-            localhttp::local_http_cancel
+            localhttp::local_http_cancel,
+            voice::voice_status,
+            voice::voice_download,
+            voice::voice_wake,
+            voice::voice_listen,
+            voice::voice_speak,
+            voice::voice_speak_stop
         ])
         .setup(|app| {
             #[cfg(desktop)]

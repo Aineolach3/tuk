@@ -177,6 +177,8 @@ class App {
       setInterval(() => void this.pollMedia(), 2000);
       setInterval(() => this.syncPet(), 300);
       await P.listen('pet-hello', () => this.syncPet(true));
+      P.onPcWake((e) => this.onPcWake(e));
+      void this.startPcWake();
       await P.listen('pet-poke', () => this.poke());
       await P.listen('pet-menu', () => {
         this.applyMode('expanded');
@@ -1582,6 +1584,7 @@ class App {
 
   /** «Тук Тук»: скачать распознавание (один раз) и включить прослушивание. */
   async toggleWake(on: boolean): Promise<void> {
+    if (P.kind === 'desktop') return this.togglePcWake(on);
     const set = this.store.data.settings;
     if (!on) {
       set.wake = false;
@@ -1640,6 +1643,146 @@ class App {
         else this.say('Не получилось скачать распознавание: ' + (st.error ?? 'нет интернета?'), 'think', 6000);
       }
     }, 1000);
+  }
+
+  // ---------------- «Тук Тук» на ПК ----------------
+
+  pcVoice: P.PcVoiceStatus | null = null;
+  pcTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** При запуске: узнать, что скачано, и снова слушать, если «Тук Тук» был включён. */
+  async startPcWake(): Promise<void> {
+    this.pcVoice = await P.pcVoiceStatus(this.voicePreset() || 'tuk');
+    await this.refreshVoice(); // скачан ли живой голос — для ⚙
+    this.updateMic();
+    if (this.store.data.settings.wake && this.pcVoice?.model === 'ready') {
+      await P.pcWake(true).catch((e) => console.warn('«Тук Тук»:', e));
+    }
+  }
+
+  /** 🎤 видна, когда на ПК скачано распознавание. */
+  updateMic(): void {
+    const mic = document.querySelector<HTMLElement>('#mic');
+    if (mic) mic.hidden = !P.canListen();
+  }
+
+  /** ⚙ → «Компьютер» → «Тук Тук»: скачать распознавание (один раз) и включить слушание. */
+  async togglePcWake(on: boolean): Promise<void> {
+    const set = this.store.data.settings;
+    set.wake = on;
+    this.store.changed('settings');
+    if (!on) {
+      await P.pcWake(false).catch(() => {});
+      this.say('Больше не слушаю «Тук Тук».', 'idle', 3000);
+    } else {
+      this.pcVoice = await P.pcVoiceStatus(this.voicePreset() || 'tuk');
+      if (!this.pcVoice?.libs) {
+        set.wake = false;
+        this.say('В этой сборке нет распознавания речи — обновите Тука.', 'think', 5000);
+      } else if (this.pcVoice.model !== 'ready') {
+        try {
+          await P.pcVoiceDownload('model');
+          this.say('Скачиваю распознавание речи (45 МБ) — это один раз, дальше всё работает без интернета.', 'carry', 6000);
+          this.watchPcModel();
+        } catch (e) {
+          set.wake = false;
+          this.say(String((e as Error).message ?? e), 'think', 6000);
+        }
+      } else {
+        try {
+          await P.pcWake(true);
+          this.say('Слушаю! Скажите «Тук Тук» — и команду. Можно сразу: «Тук Тук, напомни через час позвонить».', 'listen', 6000);
+        } catch (e) {
+          set.wake = false;
+          this.say(String((e as Error).message ?? e), 'think', 6000);
+        }
+      }
+      this.store.changed('settings');
+    }
+    this.pcVoice = await P.pcVoiceStatus(this.voicePreset() || 'tuk');
+    this.updateMic();
+    this.lastHtml = '';
+    this.render();
+  }
+
+  /** Следить за скачиванием модели и включить «Тук Тук», когда готово. */
+  watchPcModel(): void {
+    if (this.pcTimer) return;
+    this.pcTimer = setInterval(async () => {
+      const st = await P.pcVoiceStatus(this.voicePreset() || 'tuk');
+      this.pcVoice = st;
+      if (this.tab === 'settings') {
+        this.lastHtml = '';
+        this.render();
+      }
+      if (st?.model !== 'downloading') {
+        clearInterval(this.pcTimer!);
+        this.pcTimer = null;
+        if (st?.model === 'ready') await this.togglePcWake(true);
+        else {
+          this.store.data.settings.wake = false;
+          this.store.changed('settings');
+          this.say('Не получилось скачать распознавание: ' + (st?.error ?? 'нет интернета?'), 'think', 6000);
+        }
+      }
+    }, 1000);
+  }
+
+  /** Событие распознавания на ПК: «Тук Тук» услышан, человек говорит, команда готова. */
+  onPcWake(e: P.PcWakeEvent): void {
+    const input = document.querySelector<HTMLInputElement>('#input');
+    switch (e.state) {
+      case 'listen':
+        // пискнул Rust; здесь — поза «слушает» и «Слушаю…» на острове
+        this.activity();
+        void P.speakStop();
+        this.setVoice('listening');
+        this.flash('listen', 10_000);
+        this.island.reveal(10_000);
+        return;
+      case 'partial':
+        if (input) input.value = e.text;
+        this.flash('listen', 5000);
+        this.island.reveal(5000);
+        return;
+      case 'command':
+        this.setVoice('off');
+        this.tempMood = null;
+        if (input) input.value = '';
+        // команда после «Тук Тук» — тот же путь, что на телефоне: разобрать, выполнить, ответить голосом
+        this.voiceAsked = true;
+        this.voiceContinue = false;
+        void this.handleInput(e.text).finally(() => setTimeout(() => (this.voiceAsked = false), 1500));
+        return;
+      case 'idle':
+        if (this.voice === 'listening') this.setVoice('off');
+        this.tempMood = null;
+        if (input) input.value = '';
+        return;
+      case 'error':
+        if (this.voice === 'listening') this.setVoice('off');
+        this.store.data.settings.wake = false;
+        this.store.changed('settings');
+        this.say(e.text, 'think', 6000);
+        return;
+    }
+  }
+
+  pcWakeHtml(): string {
+    const st = this.pcVoice;
+    if (!st?.libs) return '';
+    const set = this.store.data.settings;
+    let h = '<h3>«Тук Тук» — голосом</h3><div class="card">';
+    if (st.model === 'downloading') {
+      h += `<b>Скачиваю распознавание…</b><div class="progress"><i style="width:${st.progress ?? 0}%"></i></div><span class="muted small">${st.progress ?? 0}% · один раз, ~45 МБ</span>`;
+    } else if (set.wake && st.wake) {
+      h += '<b>Слушаю «Тук Тук».</b> <span class="muted">Скажите «Тук Тук» — Тук пискнет и выслушает команду. Работает без интернета, даже когда Тук свёрнут.</span><div class="row"><button class="pill ghost small" data-act="wake-off">Не слушать</button></div>';
+    } else {
+      if (st.model === 'error' && st.error) h += `<p class="muted small">Не получилось: ${esc(st.error)}</p>`;
+      h += '<span class="muted">Тук всегда слушает микрофон, но откликается только на «Тук Тук», а потом выполняет команду или отвечает голосом. Распознавание работает прямо на компьютере и без интернета. Один раз нужно скачать языковую модель — около 45 МБ.</span><div class="row"><button class="pill small" data-act="wake-on">' + (st.model === 'ready' ? 'Включить' : 'Скачать и включить') + '</button></div>';
+    }
+    h += '<p class="muted small">Звук никуда не отправляется: он разбирается прямо на этом компьютере. Пока Тук слушает, Windows показывает значок микрофона в трее.</p></div>';
+    return h;
   }
 
   wakeHtml(): string {
@@ -2134,7 +2277,7 @@ class App {
   }
 
   async refreshVoice(): Promise<void> {
-    if (P.kind !== 'android') return;
+    if (P.kind === 'web') return;
     this.voiceState = await P.voice('status', this.voicePreset() || 'tuk').catch(() => null);
   }
 
@@ -2171,7 +2314,9 @@ class App {
   }
 
   voiceHtml(): string {
-    if (P.kind !== 'android') return '';
+    if (P.kind === 'web') return '';
+    const pc = P.kind === 'desktop';
+    if (pc && !this.pcVoice?.libs) return '';
     const cur = this.voicePreset();
     const st = this.voiceState;
     const opts: [string, string, string][] = [
@@ -2179,7 +2324,7 @@ class App {
       ['bright', 'Звонкий', 'светлый и мягкий'],
       ['boy', 'Мальчишка', 'бодрый, озорной'],
       ['calm', 'Спокойный', 'взрослый, без изменений'],
-      ['', 'Системный', 'голос телефона, без скачивания'],
+      ['', 'Системный', pc ? 'голос Windows, без скачивания' : 'голос телефона, без скачивания'],
     ];
     let h = '<h3>Голос Тука</h3><div class="voices">';
     for (const [id, name, about] of opts)
@@ -2188,7 +2333,7 @@ class App {
     if (st?.state === 'downloading') h += `<div class="progress"><i style="width:${st.progress ?? 0}%"></i></div><p class="muted small">Скачиваю голос… ${st.progress ?? 0}%</p>`;
     else if (cur && st?.state !== 'ready') h += `<p class="muted small">Голос ещё не скачан — нажмите на него, чтобы скачать (около 67 МБ, один раз).</p>`;
     h += `<div class="row"><button class="pill ghost small" data-act="voice-test">Послушать</button></div>`;
-    h += '<p class="muted small">Нейросетевой голос работает прямо на телефоне, без интернета.</p>';
+    h += `<p class="muted small">Нейросетевой голос работает прямо на ${pc ? 'компьютере' : 'телефоне'}, без интернета.</p>`;
     return h;
   }
 
@@ -2967,7 +3112,9 @@ class App {
       return `<h3>Музыка</h3>
       <label class="toggle"><input type="checkbox" id="set-dance" ${st.dance ? 'checked' : ''}> Танцевать под музыку</label>
       <p class="muted small">Тук видит, что играет в Spotify, Яндекс Музыке, браузере и других плеерах Windows, и управляет ими из строки.</p>
-      <h3>Команды компьютеру</h3><p class="muted small">«открой калькулятор», «найди в интернете …», «маршрут до …», «поставь таймер на 5 минут», «будильник на 7:00», «следующий трек».</p>`;
+      <h3>Команды компьютеру</h3><p class="muted small">«открой калькулятор», «найди в интернете …», «маршрут до …», «поставь таймер на 5 минут», «будильник на 7:00», «следующий трек».</p>
+      ${this.pcWakeHtml()}
+      ${this.voiceHtml()}`;
     if (P.kind === 'android')
       return `<h3>Тук над приложениями</h3>
       <div class="card">${st.island && this.islandOn ? '<b>Включён.</b> <span class="muted">Тук живёт вверху экрана, вокруг камеры. Нажатие — выпадающее окно, долгое нажатие — всё приложение.</span>' : '<span class="muted">Маленький анимированный Тук вверху экрана поверх любых приложений. Нажали — открылось небольшое окно: голос, записи, дела на сегодня.</span>'}

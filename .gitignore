@@ -4,3 +4,5 @@ src-tauri/target/
 src-tauri/gen/
 *.log
 src-tauri/tauri-plugin-tuk/android/src/main/jniLibs/
+src-tauri/voice-libs/
+src-tauri/tauri.windows.conf.json
