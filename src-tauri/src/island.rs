@@ -2,21 +2,23 @@
 //!
 //! По мотивам Coucou (MIT, Louis Raillé): src-tauri/src/island.rs.
 //!
-//! Окно «main» — прозрачное, без рамки, поверх всех, не забирает фокус в
-//! свёрнутом виде. Видимую форму (капсулу или панель) рисует только CSS,
-//! фон самого окна и WebView2 всегда прозрачный. Размер окна меняется лишь
-//! между двумя значениями:
-//!   * hidden — окно ровно по капсуле (CAPSULE_*), принимает мышь целиком,
-//!     опрос курсора спит;
-//!   * peek / home — окно размером с самую большую панель (PANEL_*), а
-//!     опрос курсора (~60 Гц) делает его «прозрачным для кликов» везде,
-//!     кроме прямоугольника острова, который присылает страница.
+//! Окно «main» — прозрачное, без рамки, поверх всех, не в Alt-Tab и не
+//! забирает фокус, пока остров не раскрыт. Видимую форму (капсулу или панель)
+//! рисует только CSS (`#shell`), фон окна и WebView2 всегда прозрачный.
 //!
-//! Так окно и CSS не могут разойтись: даже если размер окна «отстал» от
-//! состояния страницы, лишняя часть окна прозрачна и пропускает клики.
+//! Размер окна — по фазе острова (hidden → peek → home), с полями под тень
+//! (styles.css: `#shell` отстоит от краёв на 3 px сверху и 5–10 px по бокам):
+//! при раскрытии окно растёт сразу, при сворачивании — через SHRINK_DELAY_MS,
+//! когда пружинная анимация капсулы уже закончилась.
+//!
+//! Click-through: поток опроса курсора (~60 Гц в peek/home, 20 Гц в hidden)
+//! делает окно «прозрачным для мыши» везде, кроме прямоугольника `#shell`,
+//! который присылает страница (команда island_set_rect). Пока кнопка мыши
+//! зажата над окном (возможно, тащат файл) или над ним висит перетаскивание
+//! файла — окно принимает мышь целиком, иначе Проводник не нашёл бы цель.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -24,16 +26,11 @@ use tauri::{AppHandle, Emitter, Manager, Monitor, PhysicalPosition, PhysicalSize
 
 pub const LABEL: &str = "main";
 
-/// Окно раскрытого острова, логические пиксели: панель 440×640 плюс поля под тень.
-pub const PANEL_W: f64 = 480.0;
-pub const PANEL_H: f64 = 680.0;
-/// Окно свёрнутого острова: капсула 190×44 плюс чуть-чуть.
-pub const CAPSULE_W: f64 = 200.0;
-pub const CAPSULE_H: f64 = 48.0;
-
 /// Поле вокруг острова, которое ещё считается «на острове» (логические px):
 /// флаг click-through снимается чуть раньше, чем курсор дойдёт до кнопки.
-const HIT_MARGIN: f64 = 10.0;
+const HIT_MARGIN: f64 = 6.0;
+/// Свернуть окно после анимации сворачивания капсулы.
+const SHRINK_DELAY_MS: u64 = 320;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
@@ -59,6 +56,15 @@ impl Phase {
             Phase::Home => "home",
         }
     }
+
+    /// Логический размер окна: капсула/панель из styles.css плюс поля под тень.
+    pub fn window_size(self) -> (f64, f64) {
+        match self {
+            Phase::Hidden => (210.0, 56.0), // капсула ≈ 190×44
+            Phase::Peek => (440.0, 96.0),   // строка ≈ 420×84
+            Phase::Home => (460.0, 656.0),  // панель ≈ 440×640
+        }
+    }
 }
 
 /// Прямоугольник острова в логических координатах окна (присылает страница).
@@ -71,58 +77,33 @@ pub struct Rect {
 }
 
 impl Rect {
+    pub fn is_empty(&self) -> bool {
+        self.w <= 0.0 || self.h <= 0.0
+    }
+
     /// Попадает ли точка в прямоугольник с полем `margin`.
     pub fn hit(&self, x: f64, y: f64, margin: f64) -> bool {
-        self.w > 0.0 && self.h > 0.0 && x >= self.x - margin && x <= self.x + self.w + margin && y >= self.y - margin && y <= self.y + self.h + margin
+        !self.is_empty() && x >= self.x - margin && x <= self.x + self.w + margin && y >= self.y - margin && y <= self.y + self.h + margin
     }
 }
 
-/// Будит и усыпляет поток опроса курсора: спрятанный остров почти ничего не стоит.
-pub struct Gate {
-    active: Mutex<bool>,
-    cv: Condvar,
-}
-
-impl Gate {
-    pub fn new() -> Self {
-        Self { active: Mutex::new(false), cv: Condvar::new() }
+/// Принимает ли окно мышь в этой точке. Пока страница не прислала форму
+/// острова — окно целиком (иначе свёрнутый остров нельзя было бы открыть).
+pub fn accepts(rect: &Rect, x: f64, y: f64, window: (f64, f64), button_down: bool, file_drag: bool) -> bool {
+    let over_window = x >= 0.0 && x <= window.0 && y >= 0.0 && y <= window.1;
+    if rect.is_empty() {
+        return over_window;
     }
-
-    pub fn set_active(&self, on: bool) {
-        let mut g = self.active.lock().unwrap();
-        *g = on;
-        self.cv.notify_all();
-    }
-
-    pub fn is_active(&self) -> bool {
-        *self.active.lock().unwrap()
-    }
-
-    /// Ждать включения не дольше `timeout`. Возвращает, включён ли опрос.
-    pub fn wait_active(&self, timeout: Duration) -> bool {
-        let g = self.active.lock().unwrap();
-        if *g {
-            return true;
-        }
-        let (g, _) = self.cv.wait_timeout(g, timeout).unwrap();
-        *g
-    }
-
-    /// Ждать включения без ограничения.
-    pub fn wait_forever(&self) {
-        let mut g = self.active.lock().unwrap();
-        while !*g {
-            g = self.cv.wait(g).unwrap();
-        }
-    }
+    rect.hit(x, y, HIT_MARGIN) || (button_down && over_window) || file_drag
 }
 
 pub struct Island {
-    pub gate: Gate,
     phase: Mutex<Phase>,
     rect: Mutex<Rect>,
     /// «primary» — основной экран, «cursor» — экран под мышью.
     screen: Mutex<String>,
+    /// Растёт при каждой смене фазы: отложенное сжатие окна старой фазы отменяется.
+    generation: AtomicU64,
     /// Последнее применённое значение click-through (чтобы не дёргать ОС зря).
     ignoring: AtomicBool,
     /// Над окном тащат файл: окно принимает мышь целиком, пока не бросят или не уведут.
@@ -132,10 +113,10 @@ pub struct Island {
 impl Island {
     pub fn new() -> Self {
         Self {
-            gate: Gate::new(),
             phase: Mutex::new(Phase::Hidden),
             rect: Mutex::new(Rect::default()),
             screen: Mutex::new("primary".into()),
+            generation: AtomicU64::new(0),
             ignoring: AtomicBool::new(false),
             file_drag: AtomicBool::new(false),
         }
@@ -166,8 +147,7 @@ fn monitor_contains(m: &Monitor, x: f64, y: f64) -> bool {
 
 /// Курсор в физических пикселях экрана.
 pub fn cursor(app: &AppHandle) -> Option<(f64, f64)> {
-    let w = window(app)?;
-    let c = w.cursor_position().ok()?;
+    let c = window(app)?.cursor_position().ok()?;
     Some((c.x, c.y))
 }
 
@@ -187,23 +167,18 @@ fn target_monitor(app: &AppHandle, pref: &str) -> Option<Monitor> {
 /// Ключ раскладки мониторов: любое изменение — остров надо поставить заново.
 fn layout_key(app: &AppHandle) -> Vec<(i32, i32, u32, u32, u64)> {
     app.available_monitors()
-        .map(|ms| {
-            ms.iter()
-                .map(|m| (m.position().x, m.position().y, m.size().width, m.size().height, m.scale_factor().to_bits()))
-                .collect()
-        })
+        .map(|ms| ms.iter().map(|m| (m.position().x, m.position().y, m.size().width, m.size().height, m.scale_factor().to_bits())).collect())
         .unwrap_or_default()
 }
 
-/// Поставить окно по центру верхнего края нужного экрана и задать размер по фазе.
-pub fn apply_geometry(app: &AppHandle, isl: &Island) {
+/// Поставить окно по центру верхнего края нужного экрана, размер — для фазы `phase`.
+pub fn place(app: &AppHandle, isl: &Island, phase: Phase) {
     let Some(win) = window(app) else { return };
-    let pref = isl.screen();
-    let Some(m) = target_monitor(app, &pref) else { return };
+    let Some(m) = target_monitor(app, &isl.screen()) else { return };
     let scale = m.scale_factor();
     let mp = *m.position();
     let ms = *m.size();
-    let (lw, lh) = if isl.phase() == Phase::Hidden { (CAPSULE_W, CAPSULE_H) } else { (PANEL_W, PANEL_H) };
+    let (lw, lh) = phase.window_size();
     let pw = (lw * scale).round().max(1.0) as u32;
     let ph = (lh * scale).round().max(1.0) as u32;
     let x = mp.x + (ms.width as i32 - pw as i32) / 2;
@@ -219,22 +194,49 @@ pub fn apply_geometry(app: &AppHandle, isl: &Island) {
         }
     }
     let _ = win.set_always_on_top(true);
-    // после изменения размера флаг надо выставить заново: окно берёт мышь,
+    // после изменения размера флаг выставляем заново: окно берёт мышь,
     // следующий тик опроса решит по курсору
     isl.ignoring.store(false, Ordering::Relaxed);
     let _ = win.set_ignore_cursor_events(false);
 }
 
+/// Поставить окно для текущей фазы (смена экрана, раскладки мониторов).
+pub fn apply_geometry(app: &AppHandle, isl: &Island) {
+    place(app, isl, isl.phase());
+}
+
 /// Сменить фазу острова (её выбирает машина состояний на странице, src/island.ts).
-pub fn set_phase(app: &AppHandle, isl: &Island, phase: Phase) {
-    let before = {
-        let mut p = isl.phase.lock().unwrap();
-        let b = *p;
-        *p = phase;
-        b
-    };
-    if before != phase {
-        apply_geometry(app, isl);
+/// Повторная отправка той же фазы ничего не делает (страница шлёт её и раз в
+/// секунду — на случай, если вызов IPC потерялся).
+pub fn set_phase(app: &AppHandle, isl: &Arc<Island>, phase: Phase) {
+    let before = std::mem::replace(&mut *isl.phase.lock().unwrap(), phase);
+    if before == phase {
+        return;
+    }
+    let gen = isl.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    {
+        let (bw, bh) = before.window_size();
+        let (nw, nh) = phase.window_size();
+        if nw >= bw && nh >= bh {
+            // растёт — сразу, чтобы раскрывающаяся капсула не обрезалась
+            place(app, isl, phase);
+        } else {
+            // сжимается — после анимации; до тех пор лишняя часть окна прозрачна
+            // и пропускает клики (опрос курсора)
+            let (app2, isl2) = (app.clone(), isl.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(SHRINK_DELAY_MS));
+                if isl2.generation.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                let app3 = app2.clone();
+                let _ = app2.run_on_main_thread(move || {
+                    if isl2.generation.load(Ordering::SeqCst) == gen {
+                        apply_geometry(&app3, &isl2);
+                    }
+                });
+            });
+        }
     }
     if let Some(win) = window(app) {
         // фокус — только раскрытому острову (там поле ввода); в остальных фазах
@@ -246,7 +248,6 @@ pub fn set_phase(app: &AppHandle, isl: &Island, phase: Phase) {
             let _ = win.set_focus();
         }
     }
-    isl.gate.set_active(phase != Phase::Hidden);
 }
 
 pub fn set_rect(isl: &Island, r: Rect) {
@@ -295,9 +296,11 @@ struct CursorPayload {
     inside: bool,
 }
 
-/// Поток опроса курсора. Пока остров раскрыт или выглядывает — 60 Гц:
-/// click-through вне острова, событие `island-cursor` для страницы.
-/// Пока спрятан — раз в 0,4 с смотрит только на мониторы (и на мышь при «за мышью»).
+/// Поток опроса курсора (один на всё время работы).
+/// События для страницы:
+///   `island-cursor` { x, y, inside } — курсор в координатах окна; inside — над островом;
+///   `island-outside` — нажата кнопка мыши вне острова (клик мимо — свернуть);
+///   `island-screen` — остров переставлен (сменились мониторы / экран под мышью).
 pub fn spawn_poll(app: AppHandle, isl: Arc<Island>) {
     std::thread::spawn(move || {
         let mut last_layout = layout_key(&app);
@@ -305,59 +308,65 @@ pub fn spawn_poll(app: AppHandle, isl: Arc<Island>) {
         let mut last_inside: Option<bool> = None;
         let mut last_xy = (f64::MIN, f64::MIN);
         let mut ticks: u32 = 0;
+        // поколение фазы на прошлой проверке: размер сверяем, только когда фаза
+        // не менялась целую проверку (иначе помешали бы отложенному сжатию)
+        let mut settled_gen = u64::MAX;
         loop {
-            if !isl.gate.wait_active(Duration::from_millis(400)) {
-                last_inside = None;
-                // спрятан: раскладка мониторов и экран под мышью
-                let now = layout_key(&app);
-                let layout_changed = now != last_layout;
-                last_layout = now;
-                let follow = isl.screen() == "cursor" && moved_to_other_monitor(&app);
-                if layout_changed || follow {
-                    reapply(&app, &isl);
-                }
-                continue;
-            }
-            std::thread::sleep(Duration::from_millis(16));
+            let phase = isl.phase();
+            // спрятанный остров: 20 Гц; выглянул/раскрыт: ~60 Гц
+            std::thread::sleep(Duration::from_millis(if phase == Phase::Hidden { 50 } else { 16 }));
             ticks = ticks.wrapping_add(1);
-            if ticks % 30 == 0 {
+
+            // мониторы подключили/отключили/поменяли масштаб; «за мышью» — мышь ушла на другой экран;
+            // размер окна не совпал с фазой (Windows иногда «съедает» resize при смене DPI) —
+            // ставим заново. Это и есть защита от «большого тёмного прямоугольника».
+            if ticks % 25 == 0 {
                 let now = layout_key(&app);
-                if now != last_layout {
-                    last_layout = now;
+                let changed = now != last_layout;
+                last_layout = now;
+                let follow = phase == Phase::Hidden && isl.screen() == "cursor" && moved_to_other_monitor(&app);
+                let gen = isl.generation.load(Ordering::SeqCst);
+                let settled = gen == settled_gen;
+                settled_gen = gen;
+                if changed || follow || (settled && size_wrong(&app, phase)) {
                     reapply(&app, &isl);
                 }
             }
+
             let Some(win) = window(&app) else { continue };
             let Ok(origin) = win.outer_position() else { continue };
             let scale = win.scale_factor().unwrap_or(1.0);
             let Ok(c) = win.cursor_position() else { continue };
             let x = (c.x - origin.x as f64) / scale;
             let y = (c.y - origin.y as f64) / scale;
-            let (ww, wh) = win.inner_size().map(|s| (s.width as f64 / scale, s.height as f64 / scale)).unwrap_or((PANEL_W, PANEL_H));
+            let size = win.inner_size().map(|s| (s.width as f64 / scale, s.height as f64 / scale)).unwrap_or(phase.window_size());
             let r = *isl.rect.lock().unwrap();
-            let inside = r.hit(x, y, HIT_MARGIN);
+            let inside = if r.is_empty() { x >= 0.0 && x <= size.0 && y >= 0.0 && y <= size.1 } else { r.hit(x, y, HIT_MARGIN) };
 
-            // Нажатая кнопка над окном — возможно, начало перетаскивания файла.
-            // Click-through (WS_EX_TRANSPARENT) прячет окно от WindowFromPoint, и
-            // OLE не нашёл бы цель: пока кнопка зажата над окном, окно берёт мышь целиком.
             let down = left_button_down();
             if down && !was_down {
+                // нажатие — возможно, начало перетаскивания файла: заранее снимаем
+                // лишнюю цель перетаскивания WebView2 (см. win32.rs)
                 #[cfg(windows)]
                 {
                     let h = app.clone();
                     let _ = app.run_on_main_thread(move || crate::win32::unblock_webview_drops(&h));
                 }
+                if !inside && phase != Phase::Hidden {
+                    let _ = app.emit_to(LABEL, "island-outside", ());
+                }
             }
             was_down = down;
-            let over_window = x >= 0.0 && x <= ww && y >= 0.0 && y <= wh;
-            let accept = inside || (down && over_window) || isl.file_drag.load(Ordering::Relaxed);
+
+            let accept = accepts(&r, x, y, size, down, isl.file_drag.load(Ordering::Relaxed));
             if isl.ignoring.load(Ordering::Relaxed) == accept {
                 isl.ignoring.store(!accept, Ordering::Relaxed);
                 let _ = win.set_ignore_cursor_events(!accept);
             }
 
             let moved = (x - last_xy.0).abs() >= 1.0 || (y - last_xy.1).abs() >= 1.0;
-            if moved || last_inside != Some(inside) {
+            // в hidden страница узнаёт только вход/выход (наведение → peek)
+            if last_inside != Some(inside) || (moved && phase != Phase::Hidden) {
                 last_xy = (x, y);
                 last_inside = Some(inside);
                 let _ = app.emit_to(LABEL, "island-cursor", CursorPayload { x, y, inside });
@@ -366,16 +375,20 @@ pub fn spawn_poll(app: AppHandle, isl: Arc<Island>) {
     });
 }
 
-fn reapply(app: &AppHandle, isl: &Island) {
+/// Поставить остров заново (геометрия меняется в главном потоке) и сказать странице.
+fn reapply(app: &AppHandle, isl: &Arc<Island>) {
     let h = app.clone();
-    let i = state(app);
-    let _ = app.run_on_main_thread(move || {
-        if let Some(i) = i {
-            apply_geometry(&h, &i);
-        }
-    });
-    let _ = isl; // сама геометрия меняется в главном потоке
+    let i = isl.clone();
+    let _ = app.run_on_main_thread(move || apply_geometry(&h, &i));
     let _ = app.emit_to(LABEL, "island-screen", ());
+}
+
+/// Окно не того размера, что нужен фазе (больше чем на 2 px).
+fn size_wrong(app: &AppHandle, phase: Phase) -> bool {
+    let Some(win) = window(app) else { return false };
+    let (Ok(size), Ok(scale)) = (win.inner_size(), win.scale_factor()) else { return false };
+    let (lw, lh) = phase.window_size();
+    (size.width as f64 - lw * scale).abs() > 2.0 || (size.height as f64 - lh * scale).abs() > 2.0
 }
 
 /// Мышь ушла на другой монитор, чем тот, где сейчас остров.
@@ -385,11 +398,11 @@ fn moved_to_other_monitor(app: &AppHandle) -> bool {
     if monitor_contains(&cur, cx, cy) {
         return false;
     }
-    // курсор вообще на каком-то мониторе (а не в «дыре» между ними)
+    // курсор на каком-то мониторе (а не в «дыре» между ними)
     app.available_monitors().map(|ms| ms.iter().any(|m| monitor_contains(m, cx, cy))).unwrap_or(false)
 }
 
-/// Зажата ли левая кнопка мыши (на Windows; на других системах — нет данных).
+/// Зажата ли левая кнопка мыши (Windows; на других системах данных нет).
 pub fn left_button_down() -> bool {
     #[cfg(windows)]
     return crate::win32::left_button_down();
@@ -412,13 +425,30 @@ mod tests {
     }
 
     #[test]
+    fn windows_grow_with_phase() {
+        let (h, p, o) = (Phase::Hidden.window_size(), Phase::Peek.window_size(), Phase::Home.window_size());
+        assert!(h.0 < p.0 && p.0 < o.0 && h.1 < p.1 && p.1 < o.1);
+    }
+
+    #[test]
     fn rect_hit_with_margin() {
-        let r = Rect { x: 20.0, y: 0.0, w: 440.0, h: 640.0 };
-        assert!(r.hit(240.0, 300.0, 10.0));
-        assert!(r.hit(12.0, 5.0, 10.0));
-        assert!(!r.hit(5.0, 5.0, 10.0));
-        assert!(!r.hit(240.0, 660.0, 10.0));
-        assert!(!Rect::default().hit(0.0, 0.0, 10.0), "ничего не нарисовано — ничего не ловим");
+        let r = Rect { x: 10.0, y: 3.0, w: 440.0, h: 640.0 };
+        assert!(r.hit(240.0, 300.0, 6.0));
+        assert!(r.hit(5.0, 5.0, 6.0));
+        assert!(!r.hit(1.0, 5.0, 6.0));
+        assert!(!Rect::default().hit(0.0, 0.0, 6.0));
+    }
+
+    #[test]
+    fn click_through_outside_island() {
+        let r = Rect { x: 10.0, y: 3.0, w: 190.0, h: 44.0 };
+        let win = (210.0, 56.0);
+        assert!(accepts(&r, 100.0, 20.0, win, false, false));
+        assert!(!accepts(&r, 205.0, 54.0, win, false, false), "угол тени пропускает клики");
+        assert!(accepts(&r, 205.0, 54.0, win, true, false), "кнопка зажата над окном — может быть перетаскивание файла");
+        assert!(!accepts(&r, 400.0, 300.0, win, true, false), "кнопка зажата далеко — не наше");
+        assert!(accepts(&r, 400.0, 300.0, win, false, true), "над окном тащат файл");
+        assert!(accepts(&Rect::default(), 100.0, 20.0, win, false, false), "форма ещё неизвестна — окно целиком");
     }
 
     #[test]

@@ -1,10 +1,18 @@
 //! Тук — Rust-часть. Здесь только то, чего не может веб-интерфейс:
-//! файл с данными, окно-строка у верхнего края экрана, трей, горячая клавиша,
-//! сеть между ПК и телефоном. Вся логика помощника — в TypeScript (папка src).
+//! файл с данными, остров у верхнего края экрана, питомец, трей, горячая клавиша,
+//! файлы из Проводника, сеть между ПК и телефоном, запросы к локальному ИИ.
+//! Вся логика помощника — в TypeScript (папка src).
 
 #[cfg(desktop)]
 mod desktop;
+#[cfg(desktop)]
+mod files;
+#[cfg(desktop)]
+mod island;
+mod localhttp;
 mod net;
+#[cfg(windows)]
+mod win32;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -49,32 +57,85 @@ fn save_data(app: AppHandle, json: String) -> Result<(), String> {
     std::fs::rename(&tmp, &p).map_err(err)
 }
 
-// ---------- Окно-строка (только ПК) ----------
+// ---------- Остров (только ПК) ----------
+//
+// Размер окна, click-through и фокус — в island.rs. Фазу выбирает машина
+// состояний страницы (src/island.ts) и присылает с номером `seq`: вызовы IPC
+// могут прийти не по порядку, и устаревший запрос больше не оставит окно
+// большим, когда страница уже свернулась (так появлялся тёмный прямоугольник).
+
+#[cfg(desktop)]
+static PHASE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[tauri::command]
-fn set_mode(window: tauri::WebviewWindow, mode: String) -> Result<(), String> {
+fn island_set_phase(app: AppHandle, window: tauri::WebviewWindow, phase: String, seq: Option<u64>) -> Result<(), String> {
     #[cfg(desktop)]
     {
-        let (w, h) = match mode.as_str() {
-            "collapsed" => (190.0, 44.0),
-            "compact" => (420.0, 78.0),
-            _ => (440.0, 640.0),
-        };
-        window.set_size(tauri::LogicalSize::new(w, h)).map_err(err)?;
-        if let Some(m) = window.current_monitor().map_err(err)? {
-            let scale = m.scale_factor();
-            let pos = m.position();
-            let size = m.size();
-            let x = pos.x + ((size.width as f64 - w * scale) / 2.0).round() as i32;
-            window.set_position(tauri::PhysicalPosition::new(x, pos.y)).map_err(err)?;
+        use std::sync::atomic::Ordering;
+        // только окно острова: питомец (то же index.html) не должен двигать остров
+        if window.label() != island::LABEL {
+            return Ok(());
         }
-        if mode == "expanded" {
-            let _ = window.set_focus();
+        let p = island::Phase::parse(&phase).ok_or("Неизвестная фаза острова")?;
+        if let Some(seq) = seq {
+            // fetch_max: применяем, только если номер не меньше последнего
+            if PHASE_SEQ.fetch_max(seq, Ordering::SeqCst) > seq {
+                return Ok(());
+            }
+        }
+        if let Some(isl) = island::state(&app) {
+            island::set_phase(&app, &isl, p);
         }
     }
     #[cfg(mobile)]
-    let _ = (window, mode);
+    let _ = (app, window, phase, seq);
     Ok(())
+}
+
+/// Старое имя (collapsed | compact | expanded) — для совместимости.
+#[tauri::command]
+fn set_mode(app: AppHandle, window: tauri::WebviewWindow, mode: String) -> Result<(), String> {
+    island_set_phase(app, window, mode, None)
+}
+
+/// Где на странице остров (логические px окна): вне его клики проходят на рабочий стол.
+#[tauri::command]
+fn island_set_rect(app: AppHandle, window: tauri::WebviewWindow, x: f64, y: f64, width: f64, height: f64) {
+    #[cfg(desktop)]
+    {
+        if window.label() == island::LABEL {
+            if let Some(isl) = island::state(&app) {
+                island::set_rect(&isl, island::Rect { x, y, w: width, h: height });
+            }
+        }
+    }
+    #[cfg(mobile)]
+    let _ = (app, window, x, y, width, height);
+}
+
+/// Экран острова: "primary" — основной, "cursor" — где мышь.
+#[tauri::command]
+fn island_set_screen(app: AppHandle, screen: String) {
+    #[cfg(desktop)]
+    {
+        if let Some(isl) = island::state(&app) {
+            island::set_screen(&app, &isl, &screen);
+        }
+    }
+    #[cfg(mobile)]
+    let _ = (app, screen);
+}
+
+/// Страница сообщает свой devicePixelRatio; при расхождении с масштабом окна — поправка зума.
+#[tauri::command]
+fn island_fit_zoom(app: AppHandle, dpr: f64) -> bool {
+    #[cfg(desktop)]
+    return island::fit_zoom(&app, dpr);
+    #[cfg(mobile)]
+    {
+        let _ = (app, dpr);
+        false
+    }
 }
 
 #[tauri::command]
@@ -255,6 +316,36 @@ fn open_target(target: String) -> Result<(), String> {
     }
 }
 
+// ---------- Файлы (команды — в files.rs; на телефоне — заглушки) ----------
+
+#[cfg(mobile)]
+mod files {
+    #[tauri::command]
+    pub fn reveal_path(path: String) -> Result<(), String> {
+        let _ = path;
+        Err("Только на ПК".into())
+    }
+    #[tauri::command]
+    pub fn open_path(path: String) -> Result<(), String> {
+        let _ = path;
+        Err("Только на ПК".into())
+    }
+    #[tauri::command]
+    pub fn dropped_paths() -> Vec<String> {
+        Vec::new()
+    }
+    #[tauri::command]
+    pub fn read_file(path: String, max_bytes: Option<u64>) -> Result<String, String> {
+        let _ = (path, max_bytes);
+        Err("Только на ПК".into())
+    }
+    #[tauri::command]
+    pub fn read_text(path: String, max_chars: Option<usize>) -> Result<String, String> {
+        let _ = (path, max_chars);
+        Err("Только на ПК".into())
+    }
+}
+
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     app.exit(0);
@@ -282,12 +373,31 @@ fn server_start(app: AppHandle, state: State<'_, AppState>, port: u16, beacon: S
             net::json_str(&path),
             net::json_str(&body)
         );
-        let _ = handle.emit("sync-request", payload);
+        // только в окно острова: питомец (тот же index.html) не должен отвечать на запросы
+        let _ = handle.emit_to("main", "sync-request", payload);
     })
     .map_err(|e| format!("Порт {port} занят или закрыт: {e}"))?;
     net::start_beacon(beacon);
     *slot = Some(srv);
     Ok(())
+}
+
+/// Запросы, которые ещё ждут ответа интерфейса (тот же формат, что `sync-request`).
+/// Страница после перезагрузки забирает их, и ни один запрос разрешения не теряется.
+#[tauri::command]
+fn server_inflight(state: State<'_, AppState>) -> Vec<String> {
+    state
+        .server
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| {
+            s.inflight()
+                .into_iter()
+                .map(|(id, path, body)| format!("{{\"id\":{},\"path\":{},\"body\":{}}}", id, net::json_str(&path), net::json_str(&body)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -314,19 +424,41 @@ async fn discover(ms: u64) -> Result<Vec<String>, String> {
 
 // ---------- Запуск ----------
 
+/// Показать раскрытый остров (трей, хоткей, второй запуск).
 #[cfg(desktop)]
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
-        let _ = w.set_focus();
     }
+}
+
+/// Полностью прозрачный фон окна и WebView2 (на случай, если `transparent` из
+/// tauri.conf.json не дошёл до WebView2: тогда он заливает окно своим цветом).
+#[cfg(desktop)]
+fn make_transparent(w: &tauri::WebviewWindow) {
+    let clear = Some(tauri::utils::config::Color(0, 0, 0, 0));
+    let _ = w.set_background_color(clear);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut builder = tauri::Builder::default()
-        .manage(AppState::default())
-        .plugin(tauri_plugin_notification::init());
+    let mut builder = tauri::Builder::default();
+
+    #[cfg(desktop)]
+    {
+        // Второй запуск (ярлык, автозапуск, двойной клик по Tuk.exe) не создаёт
+        // второй экземпляр с вторым островом и вторым сервером на порту 47800,
+        // а открывает остров уже работающего Тука. Плагин должен быть первым.
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if argv.iter().any(|a| a == "--autostart") {
+                return;
+            }
+            show_main(app);
+            let _ = app.emit_to("main", "toggle", "open");
+        }));
+    }
+
+    builder = builder.manage(AppState::default()).plugin(tauri_plugin_notification::init());
 
     #[cfg(desktop)]
     {
@@ -345,11 +477,16 @@ pub fn run() {
             load_data,
             save_data,
             set_mode,
+            island_set_phase,
+            island_set_rect,
+            island_set_screen,
+            island_fit_zoom,
             set_autostart,
             quit_app,
             save_image,
             local_ip,
             server_start,
+            server_inflight,
             server_reply,
             http_post,
             discover,
@@ -362,7 +499,15 @@ pub fn run() {
             media_info,
             media_thumb,
             media_control,
-            open_target
+            open_target,
+            files::reveal_path,
+            files::open_path,
+            files::dropped_paths,
+            files::read_file,
+            files::read_text,
+            localhttp::local_http,
+            localhttp::local_http_stream,
+            localhttp::local_http_cancel
         ])
         .setup(|app| {
             #[cfg(desktop)]
@@ -370,6 +515,27 @@ pub fn run() {
                 use tauri::menu::{Menu, MenuItem};
                 use tauri::tray::TrayIconBuilder;
                 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+
+                let handle = app.handle().clone();
+
+                // Остров: прозрачное окно у верхнего края, не крадёт фокус, click-through вне капсулы
+                let isl = Arc::new(island::Island::new());
+                app.manage(isl.clone());
+                if let Some(w) = island::window(&handle) {
+                    make_transparent(&w);
+                    #[cfg(windows)]
+                    win32::make_non_activating(&w);
+                    files::install(&handle, &w);
+                    island::apply_geometry(&handle, &isl);
+                    let _ = w.show();
+                }
+                island::spawn_poll(handle.clone(), isl);
+
+                // Питомец: окно создано из tauri.conf.json, ждёт за краем экрана
+                if let Some(w) = app.get_webview_window(desktop::PET) {
+                    make_transparent(&w);
+                }
+                desktop::setup_pet(&handle);
 
                 // Трей
                 let open = MenuItem::with_id(app, "open", "Открыть Тук", true, None::<&str>)?;
@@ -383,14 +549,14 @@ pub fn run() {
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "open" => {
                             show_main(app);
-                            let _ = app.emit("toggle", ());
+                            let _ = app.emit_to("main", "toggle", "open");
                         }
                         "link" => {
                             show_main(app);
-                            let _ = app.emit("open-link", ());
+                            let _ = app.emit_to("main", "open-link", ());
                         }
                         "pet" => {
-                            let show = app.get_webview_window("pet").is_none();
+                            let show = !desktop::pet_visible();
                             let _ = desktop::pet_show(app, show);
                         }
                         "quit" => app.exit(0),
@@ -401,7 +567,7 @@ pub fn run() {
                 }
                 tray.build(app)?;
 
-                // Ctrl+Alt+Пробел — открыть/свернуть строку
+                // Ctrl+Alt+Пробел — открыть/свернуть остров (страница решает по своей фазе)
                 let toggle = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space);
                 let toggle_for_handler = toggle.clone();
                 app.handle().plugin(
@@ -409,7 +575,7 @@ pub fn run() {
                         .with_handler(move |app, shortcut, event| {
                             if shortcut == &toggle_for_handler && event.state() == ShortcutState::Pressed {
                                 show_main(app);
-                                let _ = app.emit("toggle", ());
+                                let _ = app.emit_to("main", "toggle", "toggle");
                             }
                         })
                         .build(),

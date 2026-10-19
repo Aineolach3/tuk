@@ -45,6 +45,7 @@ export interface Settings {
   onboarded?: boolean; // первый запуск пройден (3 шага: питомец, хоткей, мозг)
   localAi?: import('./localai.js').LocalAi; // мозг из Ollama / LM Studio на этом ПК или в домашней сети
   agentAutoClean?: boolean; // убирать закончившие и зависшие сессии сами (по умолчанию да)
+  islandScreen?: 'primary' | 'cursor'; // ПК: остров на основном экране или на том, где мышь
 }
 
 export interface Data {

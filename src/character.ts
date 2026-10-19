@@ -642,6 +642,20 @@ export class Character {
     return head || body || (Math.hypot(x - 0.38 * U, y + 1.42 * U) < 0.2 * U);
   }
 
+  /** Приостановить/возобновить цикл кадров (окно питомца спрятано за краем экрана). */
+  pause(on: boolean): void {
+    if (on === this.stopped) return;
+    this.stopped = on;
+    if (on) {
+      cancelAnimationFrame(this.raf);
+      clearTimeout(this.timer);
+      this.raf = this.timer = 0;
+    } else {
+      this.last = performance.now() - 16;
+      this.wake();
+    }
+  }
+
   /** Остановить анимацию и отписаться (если холст убирают со страницы). */
   destroy(): void {
     this.stopped = true;

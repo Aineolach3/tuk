@@ -50,6 +50,8 @@ export async function runPet(): Promise<void> {
     if (s.bpm) ch.bpm = s.bpm;
     ch.set(s.mood);
   });
+  // окно питомца живёт всё время; пока оно спрятано — не рисуем зря
+  await P.listen('pet-visible', (on: boolean) => ch.pause(!on));
   await P.emit('pet-hello', {});
 
   // ---------- глаза следят за курсором по всему экрану ----------

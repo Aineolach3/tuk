@@ -1,7 +1,7 @@
 // Копирует index.html, styles.css и движок нейросети (wllama) в dist после компиляции TypeScript.
 import { copyFileSync, cpSync, existsSync, mkdirSync } from 'node:fs';
 mkdirSync('dist', { recursive: true });
-for (const f of ['index.html', 'styles.css']) copyFileSync(`src/${f}`, `dist/${f}`);
+for (const f of ['index.html', 'styles.css', 'demo.html']) if (existsSync(`src/${f}`)) copyFileSync(`src/${f}`, `dist/${f}`);
 const wl = 'node_modules/@wllama/wllama/esm';
 if (existsSync(wl)) {
   cpSync(wl, 'dist/wllama', { recursive: true });

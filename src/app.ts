@@ -10,6 +10,7 @@ import { runPet, type PetState } from './pet.js';
 import { METRIC_LABEL, healthText, type Item, type Metric } from './model.js';
 import { REPEAT_LABEL, fmtDay, fmtTime, fmtWhen, normalize, parse } from './parser.js';
 import * as P from './platform.js';
+import { IslandFsm, MODE_OF, PHASE_OF, applyIslandClasses, unionRect } from './island.js';
 import { Store, emptyData, type Data, type StoredItem } from './store.js';
 import { Link, ago } from './link.js';
 import { qrSvg } from './qr.js';
@@ -74,7 +75,6 @@ class App {
   tempMood: Mood | null = null;
   tempUntil = 0;
   lastActivity = Date.now();
-  collapseTimer: ReturnType<typeof setTimeout> | null = null;
   pinTimer: ReturnType<typeof setInterval> | null = null;
   found: P.Found[] = [];
   lastHtml = '';
@@ -146,6 +146,8 @@ class App {
     this.applyLook();
     document.documentElement.classList.add(P.kind);
     if (P.kind === 'web') document.documentElement.classList.add('android-like');
+    // остров: машина состояний выбирает фазу, applyMode применяет её
+    this.island.onChange = (to) => this.applyMode(MODE_OF[to], true);
     this.applyMode(this.mode);
 
     this.store.onChange((reason) => {
@@ -225,7 +227,7 @@ class App {
     }
     await R.syncAndroidSchedule(this.store);
     await P.askNotifyPermission().catch(() => {});
-    await P.listen('toggle', () => this.toggleFromShortcut());
+    await P.listen('toggle', (how: unknown) => this.toggleFromShortcut(how === 'open' ? 'open' : 'toggle'));
     await P.listen('open-link', () => {
       this.applyMode('expanded');
       this.setSec = 'link';
@@ -278,7 +280,7 @@ class App {
     this.reply = text;
     this.replyUntil = Date.now() + ms + 1500;
     if (mood) this.flash(mood, ms);
-    if (P.kind === 'desktop' && this.mode === 'collapsed') this.applyMode('compact');
+    if (P.kind === 'desktop') this.island.reveal(ms + 1500);
     this.renderBar();
     this.renderReply();
     if (this.voiceAsked && text) {
@@ -323,6 +325,18 @@ class App {
       if (P.kind === 'desktop' && this.mode === 'compact' && !R.ringing(this.store).length && !this.hovering) this.applyMode('collapsed');
     }
     if (now % 15000 < 1000) this.renderBar();
+    if (P.kind === 'desktop') {
+      // звонит напоминание или ждёт запрос агента — остров сам не прячется
+      const pin = R.ringing(this.store, now).length > 0 || this.agentPending().length > 0;
+      if (pin !== this.island.pinned) {
+        if (pin) this.island.pinned = true;
+        else this.island.unpin();
+      }
+      // раз в секунду — фазу и форму острова ещё раз (вдруг вызов IPC потерялся
+      // или открылось/закрылось окно поверх; Rust одинаковые повторы игнорирует)
+      void P.islandPhase(PHASE_OF[this.mode]);
+      this.reportIslandRect(false);
+    }
     this.hub.autoClean = this.store.data.settings.agentAutoClean !== false;
     if (P.kind === 'desktop') this.hub.sweep(now);
     this.demo?.hub.sweep(now);
@@ -332,21 +346,104 @@ class App {
   // ---------------- Режимы строки (ПК) ----------------
 
   hovering = false;
+  /** ПК: машина состояний острова hidden → peek → home (src/island.ts). */
+  island = new IslandFsm();
+  private rectTimer: ReturnType<typeof setTimeout> | null = null;
 
-  applyMode(m: P.BarMode): void {
+  /**
+   * Режим строки. На ПК это фаза острова: классы html.island-* (рисует CSS),
+   * Rust меняет размер окна, click-through и фокус. fromFsm — вызов из машины
+   * состояний; иначе (старый код: say, напоминания) машина просто узнаёт новое состояние.
+   */
+  applyMode(m: P.BarMode, fromFsm = false): void {
     if (P.kind === 'desktop' && m === 'collapsed' && this.mode === 'expanded' && !this.tempMood) this.flash('away', 1300);
     this.mode = m;
     const root = document.documentElement;
     root.classList.remove('mode-collapsed', 'mode-compact', 'mode-expanded');
     root.classList.add('mode-' + m);
     this.char.peek = m === 'collapsed' && P.kind === 'desktop' ? 0.18 : 0;
+    this.char.lowPower = m === 'collapsed';
+    if (P.kind === 'desktop') {
+      if (!fromFsm) this.island.sync(PHASE_OF[m]);
+      applyIslandClasses(PHASE_OF[m], root);
+      this.reportIslandRect();
+    }
     void P.setMode(m);
     if (m === 'expanded') setTimeout(() => P.kind === 'desktop' && $<HTMLInputElement>('#input').focus(), 60);
     this.renderBar();
   }
 
-  toggleFromShortcut(): void {
+  /** Сообщить Rust, где видимый остров: вне него клики проходят на рабочий стол. */
+  reportIslandRect(again = true): void {
+    if (P.kind !== 'desktop') return;
+    const send = () => {
+      const ov = $('#overlay');
+      // поверх открыто знакомство или сводка — окно принимает мышь целиком
+      if (ov && !ov.hidden) return void P.islandRect({ x: 0, y: 0, width: innerWidth, height: innerHeight });
+      const r = $('#shell').getBoundingClientRect();
+      void P.islandRect(unionRect([{ x: r.left, y: r.top, width: r.width, height: r.height }]));
+    };
+    send();
+    if (!again) return;
+    // и ещё раз, когда пружинная анимация фазы закончится
+    if (this.rectTimer) clearTimeout(this.rectTimer);
+    this.rectTimer = setTimeout(send, 650);
+  }
+
+  /**
+   * ПК: входы машины состояний острова. Наведение и «клик мимо» сообщает Rust
+   * (опрос курсора видит мышь и там, где окно прозрачно для кликов), DOM — запасной путь.
+   */
+  bindIsland(): void {
+    const enter = () => {
+      this.hovering = true;
+      this.island.enter();
+    };
+    const leave = () => {
+      this.hovering = false;
+      this.island.leave();
+    };
+    void P.listen('island-cursor', (c: { inside: boolean }) => (c.inside ? !this.hovering && enter() : this.hovering && leave()));
+    void P.listen('island-outside', () => this.island.outside());
+    void P.listen('island-screen', () => {
+      void P.islandFitZoom();
+      this.reportIslandRect();
+    });
+    $('#shell').addEventListener('mouseenter', () => !this.hovering && enter());
+    $('#shell').addEventListener('mouseleave', () => this.hovering && leave());
+    window.addEventListener('blur', () => {
+      setTimeout(() => {
+        if (!document.hasFocus()) this.island.blur();
+      }, 250);
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && $('#overlay').hidden) this.island.escape();
+    });
+    new ResizeObserver(() => this.reportIslandRect()).observe($('#shell'));
+    window.addEventListener('resize', () => this.reportIslandRect());
+    // файл тащат над островом или питомцем — Тук насторожился
+    void P.listen('files-hover', (h: { state: string }) => {
+      if (h.state === 'enter') this.flash('listen', 1500);
+    });
+    // питомца закрыли из его окна (двойной клик) или из трея
+    void P.listen('pet-visible', (on: boolean) => {
+      if (this.petOpen === on) return;
+      this.petOpen = on;
+      this.lastHtml = '';
+      this.render();
+    });
+    void P.islandFitZoom();
+    void P.islandScreen(this.store.data.settings.islandScreen === 'cursor' ? 'cursor' : 'primary');
+  }
+
+  toggleFromShortcut(how: 'toggle' | 'open' = 'toggle'): void {
     this.activity();
+    if (P.kind === 'desktop') {
+      if (how === 'open') this.island.open();
+      else this.island.toggle();
+      if (this.mode === 'expanded') this.flash('listen', 1500);
+      return;
+    }
     if (this.mode === 'expanded') this.applyMode('collapsed');
     else {
       this.applyMode('expanded');
@@ -837,7 +934,8 @@ class App {
       case 'file-folder':
         if (!c.path) return;
         try {
-          await P.openTarget(act === 'file-open' ? c.path : c.path.replace(/[\\/][^\\/]*$/, ''));
+          if (act === 'file-open') await P.openPath(c.path).catch(() => P.openTarget(c.path!));
+          else await P.revealPath(c.path).catch(() => P.openTarget(c.path!.replace(/[\\/][^\\/]*$/, '')));
         } catch (e) {
           this.say('Не получилось открыть: ' + String((e as Error).message ?? e), 'think', 4000);
         }
@@ -2050,31 +2148,10 @@ class App {
         this.flash('happy', 1200);
         return;
       }
-      this.applyMode(this.mode === 'expanded' ? 'collapsed' : 'expanded');
+      this.island.click();
     });
 
-    if (P.kind === 'desktop') {
-      document.body.addEventListener('mouseenter', () => {
-        this.hovering = true;
-        if (this.collapseTimer) clearTimeout(this.collapseTimer);
-        if (this.mode === 'collapsed') this.applyMode('compact');
-      });
-      document.body.addEventListener('mouseleave', () => {
-        this.hovering = false;
-        if (this.mode !== 'compact') return;
-        this.collapseTimer = setTimeout(() => {
-          if (this.mode === 'compact' && !R.ringing(this.store).length && Date.now() > this.replyUntil) this.applyMode('collapsed');
-        }, 900);
-      });
-      window.addEventListener('blur', () => {
-        setTimeout(() => {
-          if (!document.hasFocus() && this.mode === 'expanded') this.applyMode(R.ringing(this.store).length ? 'compact' : 'collapsed');
-        }, 250);
-      });
-      document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') this.applyMode('collapsed');
-      });
-    }
+    if (P.kind === 'desktop') this.bindIsland();
 
     document.addEventListener('keydown', (e) => this.onKey(e));
 
@@ -2094,6 +2171,9 @@ class App {
       else if (t.id === 'set-autostart') {
         st.autostart = t.checked;
         void P.setAutostart(t.checked);
+      } else if (t.id === 'set-screen') {
+        st.islandScreen = t.value === 'cursor' ? 'cursor' : 'primary';
+        void P.islandScreen(st.islandScreen);
       } else if (t.id === 'set-name') st.name = t.value.trim() || 'Тук';
       else if (t.id === 'set-usepc') st.usePcBrain = t.checked;
       else if (t.id === 'set-dance') st.dance = t.checked;
@@ -2692,6 +2772,7 @@ class App {
       <label class="toggle"><input type="checkbox" id="set-sound" ${st.sound ? 'checked' : ''}> Звуки</label>
       <label class="field"><span>Громкость</span><input type="range" id="set-volume" min="0" max="100" value="${Math.round((st.volume ?? 0.5) * 100)}"></label>
       ${P.kind === 'desktop' ? `<label class="toggle"><input type="checkbox" id="set-autostart" ${st.autostart ? 'checked' : ''}> Запускать вместе с Windows</label>
+      <label class="field"><span>Экран острова</span><select id="set-screen"><option value="primary" ${st.islandScreen !== 'cursor' ? 'selected' : ''}>Основной</option><option value="cursor" ${st.islandScreen === 'cursor' ? 'selected' : ''}>Тот, где мышь</option></select></label>
       <p class="muted small">Открыть строку: <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Пробел</kbd>. Свернуть: <kbd>Esc</kbd>. <button class="linkbtn" data-act="shortcuts">Все горячие клавиши</button></p>` : ''}
       <h3>Сводка</h3>
       <button class="pill ghost" data-act="recap">Сводка за неделю</button>

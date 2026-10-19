@@ -14,8 +14,8 @@
       {
         "label": "main",
         "title": "Тук",
-        "width": 190,
-        "height": 44,
+        "width": 210,
+        "height": 56,
         "resizable": false,
         "maximizable": false,
         "minimizable": false,
@@ -26,7 +26,32 @@
         "shadow": false,
         "center": false,
         "focus": false,
-        "dragDropEnabled": false
+        "dragDropEnabled": true,
+        "backgroundColor": "#00000000",
+        "closable": false
+      },
+      {
+        "label": "pet",
+        "title": "Тук",
+        "url": "index.html",
+        "width": 120,
+        "height": 144,
+        "x": -32000,
+        "y": -32000,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "closable": false,
+        "decorations": false,
+        "transparent": true,
+        "backgroundColor": "#00000000",
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "center": false,
+        "focus": false,
+        "visible": true,
+        "dragDropEnabled": true
       }
     ],
     "security": {

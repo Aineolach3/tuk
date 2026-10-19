@@ -50,7 +50,42 @@ export async function saveData(json: string): Promise<void> {
 }
 
 export async function setMode(mode: BarMode): Promise<void> {
-  if (kind === 'desktop') await invoke('set_mode', { mode }).catch(() => {});
+  const phase = mode === 'collapsed' ? 'hidden' : mode === 'compact' ? 'peek' : 'home';
+  await islandPhase(phase);
+}
+
+// ---------- Остров (ПК) ----------
+// Фазу выбирает машина состояний src/island.ts; Rust меняет размер окна,
+// click-through и фокус (src-tauri/src/island.rs).
+
+export type IslandPhaseName = 'hidden' | 'peek' | 'home';
+// номер растёт и после перезагрузки страницы (Rust помнит последний): мс × 1000 + счётчик
+let phaseCounter = 0;
+const nextPhaseSeq = () => Date.now() * 1000 + (++phaseCounter % 1000);
+
+/** Окно этой страницы — остров (а не питомец). */
+const isIslandWindow = () => kind === 'desktop' && windowLabel() === 'main';
+
+/** Сообщить Rust фазу острова. Номер по порядку: устаревший вызов IPC не применится. */
+export async function islandPhase(phase: IslandPhaseName): Promise<void> {
+  if (!isIslandWindow()) return;
+  await invoke('island_set_phase', { phase, seq: nextPhaseSeq() }).catch(() => {});
+}
+
+/** Где на странице видимый остров (CSS px = логические px окна): вне него клики проходят насквозь. */
+export async function islandRect(r: { x: number; y: number; width: number; height: number }): Promise<void> {
+  if (!isIslandWindow()) return;
+  await invoke('island_set_rect', { x: r.x, y: r.y, width: r.width, height: r.height }).catch(() => {});
+}
+
+/** Экран острова: основной или тот, где мышь. */
+export async function islandScreen(screen: 'primary' | 'cursor'): Promise<void> {
+  if (kind === 'desktop') await invoke('island_set_screen', { screen }).catch(() => {});
+}
+
+/** Поправить зум WebView2, если devicePixelRatio не совпал с масштабом окна. */
+export async function islandFitZoom(): Promise<void> {
+  if (isIslandWindow()) await invoke('island_fit_zoom', { dpr: window.devicePixelRatio || 1 }).catch(() => {});
 }
 
 export async function listen(event: string, cb: (payload: any) => void): Promise<void> {
@@ -139,6 +174,16 @@ export async function startServer(port: number, beacon: string): Promise<void> {
   await invoke('server_start', { port, beacon });
 }
 
+/**
+ * Запросы, которые ещё ждут ответа страницы (формат как у события `sync-request`).
+ * Вызвать после перезагрузки страницы: ждущие запросы разрешений Claude Code не потеряются.
+ */
+export async function serverInflight(): Promise<SyncRequestEvent[]> {
+  if (kind !== 'desktop') return [];
+  const raw: string[] = await invoke('server_inflight').catch(() => []);
+  return raw.map((r) => JSON.parse(r) as SyncRequestEvent);
+}
+
 export async function serverReply(id: number, status: number, body: string): Promise<void> {
   await invoke('server_reply', { id, status, body });
 }
@@ -201,6 +246,97 @@ export async function emit(event: string, payload: unknown): Promise<void> {
 }
 
 export const petShow = (show: boolean) => (kind === 'desktop' ? invoke('pet_show', { show }) : Promise.resolve());
+
+// ---------- Файлы (ПК) ----------
+
+/** Файл, брошенный из Проводника (событие `files-drop`). */
+export interface DroppedFile {
+  name: string;
+  path: string;
+  size: number;
+  /** Содержимое base64; нет — больше 50 МБ, папка или не прочитать. */
+  data?: string;
+  dir?: boolean;
+  error?: string;
+}
+
+/** Пути последнего броска (если страница перезагрузилась и событие пропустила). */
+export const droppedPaths = (): Promise<string[]> => (kind === 'desktop' ? invoke('dropped_paths') : Promise.resolve([]));
+
+/** Байты брошенного файла (base64), не больше maxBytes (≤ 50 МБ). Только для брошенных файлов. */
+export async function readDroppedFile(path: string, maxBytes?: number): Promise<Uint8Array> {
+  const b64: string = await invoke('read_file', { path, maxBytes });
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/** Текст брошенного файла (UTF-8), не больше maxChars символов. */
+export const readDroppedText = (path: string, maxChars?: number): Promise<{ text: string; truncated: boolean; size: number }> =>
+  invoke('read_text', { path, maxChars });
+
+/** «Показать в папке»: Проводник с выделенным файлом. */
+export async function revealPath(path: string): Promise<void> {
+  if (kind === 'desktop') await invoke('reveal_path', { path });
+}
+
+/** «Открыть»: файл в программе по умолчанию. */
+export async function openPath(path: string): Promise<void> {
+  if (kind === 'desktop') await invoke('open_path', { path });
+}
+
+// ---------- Локальный ИИ (Ollama, LM Studio) через Rust ----------
+// fetch из WebView упирается в COEP/смешанное содержимое; Rust ходит сам,
+// только на этот компьютер и в домашнюю сеть (src-tauri/src/localhttp.rs).
+
+/** Есть ли Rust-прокси (ПК и телефон в приложении; в браузере — нет). */
+export const hasLocalHttp = (): boolean => !!T;
+
+/** Запрос целиком: { status, body }. */
+export function localHttp(method: 'GET' | 'POST' | 'DELETE', url: string, body?: string): Promise<{ status: number; body: string }> {
+  return invoke('local_http', { method, url, body });
+}
+
+/**
+ * Потоковый запрос: onText получает куски ответа (как пришли по сети).
+ * Промис завершается статусом; signal.abort() останавливает запрос.
+ */
+export async function localHttpStream(method: 'GET' | 'POST', url: string, body: string | undefined, onText: (piece: string) => void, signal?: AbortSignal): Promise<number> {
+  let id = -1;
+  const early: { id: number; text: string }[] = [];
+  let finish: (st: number) => void = () => {};
+  let fail: (e: Error) => void = () => {};
+  const done = new Promise<number>((res, rej) => {
+    finish = res;
+    fail = rej;
+  });
+  let doneEarly: { id: number; status: number; error?: string | null } | null = null;
+  const settle = (d: { status: number; error?: string | null }) => (d.error ? fail(new Error(d.error)) : finish(d.status));
+  const un1 = await T.event.listen('local-http-chunk', (e: any) => {
+    if (id < 0) early.push(e.payload);
+    else if (e.payload.id === id) onText(e.payload.text);
+  });
+  const un2 = await T.event.listen('local-http-done', (e: any) => {
+    if (id < 0) doneEarly = e.payload;
+    else if (e.payload.id === id) settle(e.payload);
+  });
+  try {
+    id = await invoke('local_http_stream', { method, url, body });
+    for (const c of early) if (c.id === id) onText(c.text);
+    const de = doneEarly as { id: number; status: number; error?: string | null } | null;
+    if (de && de.id === id) settle(de);
+    const stop = () => void invoke('local_http_cancel', { id }).catch(() => {});
+    if (signal) {
+      if (signal.aborted) stop();
+      else signal.addEventListener('abort', stop, { once: true });
+    }
+    return await done;
+  } finally {
+    un1?.();
+    un2?.();
+  }
+}
 export const petDrag = () => invoke('pet_drag').catch(() => {});
 export const cursorRel = (): Promise<[number, number] | null> => invoke('cursor_rel').catch(() => null);
 

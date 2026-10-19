@@ -19,19 +19,121 @@ const MAX_BODY: usize = 32 * 1024 * 1024;
 
 type Reply = (u16, String);
 
+/// Сколько хук Claude Code ждёт решения по разрешению. Чуть меньше, чем ждёт
+/// сам `Tuk.exe --hook` (115 с), — чтобы ответ «нет решения» успел дойти.
+const HOOK_WAIT_SECS: u64 = 112;
+
 /// Сервер: каждый входящий запрос передаётся наружу (в интерфейс) и ждёт ответа через `reply`.
 pub struct Server {
     pending: Mutex<HashMap<u64, Sender<Reply>>>,
+    /// Запросы, которые ещё ждут ответа интерфейса: (путь, тело). Если страница
+    /// перезагрузилась, `resend` присылает их заново — ни один не теряется.
+    inflight: Mutex<HashMap<u64, (String, String)>>,
     next: AtomicU64,
     pub port: u16,
 }
 
 impl Server {
     pub fn reply(&self, id: u64, status: u16, body: String) {
+        self.inflight.lock().unwrap().remove(&id);
         if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
             let _ = tx.send((status, body));
         }
     }
+
+    /// Запросы, ждущие ответа, по порядку прихода.
+    pub fn inflight(&self) -> Vec<(u64, String, String)> {
+        let mut v: Vec<(u64, String, String)> = self.inflight.lock().unwrap().iter().map(|(id, (p, b))| (*id, p.clone(), b.clone())).collect();
+        v.sort_by_key(|x| x.0);
+        v
+    }
+}
+
+/// Нужен ли этому событию хука ответ интерфейса (решение человека).
+/// Ждут только PermissionRequest (в т. ч. AskUserQuestion); остальные события
+/// Claude Code получают пустой ответ сразу, а интерфейс узнаёт о них событием.
+pub fn hook_blocks(body: &str) -> bool {
+    hook_field(body, "hook_event_name") == "PermissionRequest"
+}
+
+/// Строковое поле верхнего уровня JSON-объекта (session_id, hook_event_name …).
+/// Ключи во вложенных объектах (tool_input) и внутри строк не учитываются.
+pub fn hook_field(body: &str, key: &str) -> String {
+    let b = body.as_bytes();
+    let mut i = 0;
+    let mut depth = 0i32;
+    // ожидаем ключ: после '{' или ',' на уровне 1
+    let mut expect_key = false;
+    while i < b.len() {
+        match b[i] {
+            b'{' | b'[' => {
+                depth += 1;
+                expect_key = depth == 1 && b[i] == b'{';
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            b',' => {
+                expect_key = depth == 1;
+                i += 1;
+            }
+            b'"' => {
+                let Some((text, end)) = json_string(b, i) else { return String::new() };
+                i = end;
+                if depth == 1 && expect_key {
+                    expect_key = false;
+                    if text == key {
+                        // пропустить пробелы и двоеточие, взять строковое значение
+                        while i < b.len() && (b[i] == b' ' || b[i] == b':' || b[i] == b'\n' || b[i] == b'\r' || b[i] == b'\t') {
+                            i += 1;
+                        }
+                        if i < b.len() && b[i] == b'"' {
+                            return json_string(b, i).map(|(t, _)| t).unwrap_or_default();
+                        }
+                        return String::new();
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    String::new()
+}
+
+/// Строка JSON с позиции открывающей кавычки: (текст, позиция после закрывающей).
+fn json_string(b: &[u8], start: usize) -> Option<(String, usize)> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = start + 1;
+    while i < b.len() {
+        match b[i] {
+            b'"' => return Some((String::from_utf8_lossy(&out).into_owned(), i + 1)),
+            b'\\' => {
+                let c = *b.get(i + 1)?;
+                match c {
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    b'u' => {
+                        let hex = std::str::from_utf8(b.get(i + 2..i + 6)?).ok()?;
+                        let cp = u32::from_str_radix(hex, 16).ok()?;
+                        let ch = char::from_u32(cp).unwrap_or('\u{fffd}');
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                        i += 4;
+                    }
+                    other => out.push(other),
+                }
+                i += 2;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    None
 }
 
 pub fn start_server<F>(port: u16, on_request: F) -> std::io::Result<Arc<Server>>
@@ -42,6 +144,7 @@ where
     let real_port = listener.local_addr()?.port();
     let server = Arc::new(Server {
         pending: Mutex::new(HashMap::new()),
+        inflight: Mutex::new(HashMap::new()),
         next: AtomicU64::new(1),
         port: real_port,
     });
@@ -94,14 +197,27 @@ where
         return write_response(&mut stream, 405, "Только POST");
     }
     let id = srv.next.fetch_add(1, Ordering::Relaxed);
+    let body = String::from_utf8_lossy(&body).into_owned();
+    let hook = path.starts_with("/hook");
+    // Событие хука без решения: Claude Code не ждёт интерфейс (раньше каждое событие
+    // каждой сессии держало Claude Code до ответа страницы). Порядок событий одной
+    // сессии сохраняется: Claude Code шлёт следующее, только дождавшись этого ответа.
+    if hook && !hook_blocks(&body) {
+        on_request(id, path, body);
+        return write_response(&mut stream, 200, "");
+    }
     let (tx, rx) = channel();
     srv.pending.lock().unwrap().insert(id, tx);
-    on_request(id, path, String::from_utf8_lossy(&body).into_owned());
-    let (status, text) = match rx.recv_timeout(Duration::from_secs(REPLY_TIMEOUT_SECS.load(Ordering::Relaxed))) {
+    srv.inflight.lock().unwrap().insert(id, (path.clone(), body.clone()));
+    on_request(id, path, body);
+    let wait = if hook { HOOK_WAIT_SECS } else { REPLY_TIMEOUT_SECS.load(Ordering::Relaxed) };
+    let (status, text) = match rx.recv_timeout(Duration::from_secs(wait)) {
         Ok(r) => r,
         Err(_) => {
             srv.pending.lock().unwrap().remove(&id);
-            (503, "Приложение не ответило".to_string())
+            srv.inflight.lock().unwrap().remove(&id);
+            // хук: пустой ответ — Claude Code спросит в терминале как обычно
+            if hook { (200, String::new()) } else { (503, "Приложение не ответило".to_string()) }
         }
     };
     write_response(&mut stream, status, &text)
@@ -345,6 +461,66 @@ pub fn json_str(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Три сессии Claude Code одновременно: обычные события не ждут интерфейс,
+    /// запросы разрешений ждут каждый своего ответа и не путаются.
+    #[test]
+    fn hooks_from_many_sessions() {
+        let holder: Arc<Mutex<Option<Arc<Server>>>> = Arc::new(Mutex::new(None));
+        let seen: Arc<Mutex<Vec<(u64, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let (h2, s2) = (holder.clone(), seen.clone());
+        let srv = start_server(0, move |id, _path, body| {
+            let sid = hook_field(&body, "session_id");
+            s2.lock().unwrap().push((id, sid.clone()));
+            if hook_blocks(&body) {
+                // решение приходит позже и в обратном порядке
+                let h = h2.clone();
+                thread::spawn(move || {
+                    let wait = match sid.as_str() { "a" => 300, "b" => 200, _ => 100 };
+                    thread::sleep(Duration::from_millis(wait));
+                    let s = h.lock().unwrap().clone().unwrap();
+                    s.reply(id, 200, format!("{{\"for\":\"{sid}\"}}"));
+                });
+            }
+        })
+        .unwrap();
+        *holder.lock().unwrap() = Some(srv.clone());
+        let port = srv.port;
+        // обычное событие — ответ сразу, без интерфейса
+        let t = Instant::now();
+        let r = http_post_t("127.0.0.1", port, "/hook", r#"{"hook_event_name":"PreToolUse","session_id":"a"}"#, 1, 5).unwrap();
+        assert_eq!(r, "");
+        assert!(t.elapsed() < Duration::from_millis(500));
+        let joins: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|sid| {
+                thread::spawn(move || {
+                    let body = format!(r#"{{"hook_event_name":"PermissionRequest","session_id":"{sid}"}}"#);
+                    (sid, http_post_t("127.0.0.1", port, "/hook", &body, 1, 5).unwrap())
+                })
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(srv.inflight().len(), 3, "все три ждут и видны для повторной отправки");
+        for j in joins {
+            let (sid, r) = j.join().unwrap();
+            assert_eq!(r, format!("{{\"for\":\"{sid}\"}}"));
+        }
+        assert!(srv.inflight().is_empty());
+        assert_eq!(seen.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn hook_kinds() {
+        assert!(hook_blocks(r#"{"hook_event_name":"PermissionRequest","tool_name":"AskUserQuestion"}"#));
+        assert!(!hook_blocks(r#"{"hook_event_name":"Stop"}"#));
+        assert!(!hook_blocks("не json"));
+        assert_eq!(hook_field(r#"{"session_id":"x1"}"#, "session_id"), "x1");
+        // ключ во вложенном объекте и внутри строки не считается
+        let tricky = r#"{"tool_input":{"session_id":"чужой","t":"\"session_id\":\"z\""}, "session_id" : "моя\u0020сессия", "hook_event_name":"Stop"}"#;
+        assert_eq!(hook_field(tricky, "session_id"), "моя сессия");
+        assert!(!hook_blocks(r#"{"tool_input":{"hook_event_name":"PermissionRequest"},"hook_event_name":"PreToolUse"}"#));
+    }
 
     #[test]
     fn roundtrip_post() {
