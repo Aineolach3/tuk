@@ -89,6 +89,13 @@ jobs:
           cp /tmp/jniLibs/arm64-v8a/libsherpa-onnx-jni.so /tmp/jniLibs/arm64-v8a/libonnxruntime.so "$J/"
           ls -la "$J"
 
+      # постоянный ключ подписи: иначе каждая сборка подписана новым случайным ключом
+      # и Android отказывается ставить обновление поверх («Приложение не установлено»)
+      - name: Постоянный ключ подписи
+        run: |
+          mkdir -p ~/.android
+          cp signing/debug.keystore ~/.android/debug.keystore
+
       - name: Сборка APK
         run: |
           export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
