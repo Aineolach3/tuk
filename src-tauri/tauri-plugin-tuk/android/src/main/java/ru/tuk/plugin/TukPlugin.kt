@@ -205,6 +205,10 @@ class TukPlugin(private val activity: Activity) : Plugin(activity) {
                 }
                 Island.saveSprite(activity, m, d, a.frames ?: 1, a.fps ?: 8)
             }
+            "look" -> {
+                // наряд и цвета для живого Тука на острове (JSON {outfit, hood, light})
+                a.data?.let { Island.setLook(activity, it) }
+            }
             "consume" -> {
                 r.put("drop", Island.drop)
                 Island.cmd?.let { r.put("cmd", it) }

@@ -7,8 +7,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
@@ -23,6 +25,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.text.TextPaint
 import android.text.TextUtils
 import android.util.Base64
@@ -31,7 +34,16 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.core.content.ContextCompat
+import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import java.io.File
 
 /** Общее состояние: его меняют плагин (из JS), остров и распознаватель «Тук Тук». */
@@ -48,6 +60,8 @@ object Island {
     /** Пока Тук сам слушает «Тук Тук» и команду, его настроение задаёт распознаватель. */
     @Volatile var wakeMood: String? = null
     @Volatile var wakeText: String? = null
+    /** Наряд и цвета Тука (JSON {outfit, hood, light}) — для живого Тука в WebView. */
+    @Volatile var look: String? = null
     var service: IslandService? = null
 
     fun spriteDir(ctx: Context): File = File(ctx.filesDir, "island").apply { mkdirs() }
@@ -59,6 +73,12 @@ object Island {
         service?.reloadSprite(mood)
     }
 
+    fun setLook(ctx: Context, json: String) {
+        look = json
+        prefs(ctx).edit().putString("look", json).apply()
+        service?.reloadLook()
+    }
+
     fun refresh() {
         service?.refresh()
     }
@@ -68,12 +88,35 @@ object Island {
 
 class IslandService : Service() {
     private lateinit var wm: WindowManager
-    private var view: IslandView? = null
+    /** Окно острова: живой Тук в WebView или, если WebView недоступен, старые кадры. */
+    private var view: View? = null
+    private var web: IslandWeb? = null
     private var params: WindowManager.LayoutParams? = null
     private val main = Handler(Looper.getMainLooper())
     var wake: Wake? = null
     private var show = true
     private var wakeOn = false
+    /** Экран включён — без этого анимацию не крутим. */
+    private var screenOn = true
+    /** WebView однажды не завёлся — до перезапуска сервиса рисуем нативно. */
+    private var webBroken = false
+    private var lastMood = ""
+
+    private val dp get() = resources.displayMetrics.density
+    /** Размер персонажа на экране (как у прежнего острова), px. */
+    private val charW get() = (IslandWeb.CHAR_W_DP * dp).toInt()
+    private val charH get() = (IslandWeb.CHAR_H_DP * dp).toInt()
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            when (i?.action) {
+                Intent.ACTION_SCREEN_OFF -> screenOn = false
+                Intent.ACTION_SCREEN_ON -> screenOn = true
+                else -> return
+            }
+            refresh()
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -84,6 +127,16 @@ class IslandService : Service() {
         val p = Island.prefs(this)
         show = p.getBoolean("show", true)
         wakeOn = p.getBoolean("wake", false)
+        if (Island.look == null) Island.look = p.getString("look", null)
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        screenOn = pm.isInteractive
+        val f = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }
+        // системные широковещательные доходят и до неэкспортированного приёмника
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(screenReceiver, f, Context.RECEIVER_NOT_EXPORTED)
+        else registerReceiver(screenReceiver, f)
         startAsForeground()
     }
 
@@ -100,10 +153,11 @@ class IslandService : Service() {
 
     override fun onDestroy() {
         Island.service = null
+        runCatching { unregisterReceiver(screenReceiver) }
+        main.removeCallbacksAndMessages(null)
         wake?.stop()
         wake = null
-        view?.let { runCatching { wm.removeView(it) } }
-        view = null
+        removeView()
         super.onDestroy()
     }
 
@@ -151,10 +205,7 @@ class IslandService : Service() {
 
     private fun apply() {
         if (show && view == null) addView()
-        if (!show && view != null) {
-            runCatching { wm.removeView(view) }
-            view = null
-        }
+        if (!show && view != null) removeView()
         val canWake = wakeOn && micForeground && Wake.modelReady(this)
         if (canWake && wake == null) {
             wake = Wake(this, this).also { it.start() }
@@ -180,18 +231,37 @@ class IslandService : Service() {
         runCatching { startActivity(launchIntent(drop)) }
     }
 
+    private fun removeView() {
+        view?.let { runCatching { wm.removeView(it) } }
+        web?.destroy()
+        web = null
+        view = null
+    }
+
+    /** Живой Тук возможен: страница острова лежит в assets и WebView ещё не падал. */
+    private fun webPossible(): Boolean =
+        !webBroken && runCatching { assets.list("island")?.contains("island-android.html") == true }.getOrDefault(false)
+
     @SuppressLint("ClickableViewAccessibility")
     private fun addView() {
-        val v = IslandView(this)
+        // живой Тук в прозрачном WebView; если WebView не создаётся (нет/обновляется провайдер) — старые кадры
+        var w: IslandWeb? = null
+        if (webPossible()) {
+            w = runCatching { IslandWeb(this, ::onWebWidth, ::onWebFailed) }.getOrNull()
+            if (w == null) webBroken = true
+        }
+        val v: View = w?.view ?: IslandView(this)
         val type = if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
         val p = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            // окно ровно по персонажу; облачко расширяет его вправо (onWebWidth)
+            if (w != null) charW else WindowManager.LayoutParams.WRAP_CONTENT,
+            if (w != null) charH else WindowManager.LayoutParams.WRAP_CONTENT,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
             PixelFormat.TRANSLUCENT
         )
         p.gravity = Gravity.TOP or Gravity.START
@@ -201,81 +271,345 @@ class IslandService : Service() {
         // место с прошлого раза или слева от камеры
         val prefs = Island.prefs(this)
         val screenW = resources.displayMetrics.widthPixels
-        p.x = prefs.getInt("x", screenW / 2 - v.charW - (8 * resources.displayMetrics.density).toInt())
+        p.x = prefs.getInt("x", screenW / 2 - charW - (8 * dp).toInt())
         p.y = prefs.getInt("y", 0)
 
+        var dragging = false
         val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
             override fun onSingleTapUp(e: MotionEvent): Boolean {
-                v.bounce()
+                web?.tap() ?: (view as? IslandView)?.bounce()
                 openApp(true)
                 return true
             }
             override fun onLongPress(e: MotionEvent) {
-                if (!v.dragging) openApp(false)
+                if (!dragging) openApp(false)
             }
         })
         var sx = 0f
         var sy = 0f
         var px = 0
         var py = 0
-        val slop = 12 * resources.displayMetrics.density
+        // скорость перетаскивания для «полёта» Тука, dp/с
+        var lx = 0f
+        var ly = 0f
+        var lt = 0L
+        var vx = 0f
+        var vy = 0f
+        var flySent = 0L
+        val slop = 12 * dp
+        fun cancelGesture(e: MotionEvent) {
+            val cancel = MotionEvent.obtain(e)
+            cancel.action = MotionEvent.ACTION_CANCEL
+            gd.onTouchEvent(cancel)
+            cancel.recycle()
+        }
         v.setOnTouchListener { _, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     sx = e.rawX; sy = e.rawY; px = p.x; py = p.y
-                    v.dragging = false
+                    lx = e.rawX; ly = e.rawY; lt = e.eventTime
+                    vx = 0f; vy = 0f
+                    dragging = false
+                    (v as? IslandView)?.dragging = false
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = e.rawX - sx
                     val dy = e.rawY - sy
-                    if (!v.dragging && (Math.abs(dx) > slop || Math.abs(dy) > slop)) v.dragging = true
-                    if (v.dragging) {
-                        p.x = (px + dx).toInt().coerceIn(0, resources.displayMetrics.widthPixels - v.charW)
-                        p.y = (py + dy).toInt().coerceIn(0, resources.displayMetrics.heightPixels - v.charH)
+                    if (!dragging && (Math.abs(dx) > slop || Math.abs(dy) > slop)) {
+                        dragging = true
+                        (v as? IslandView)?.dragging = true
+                    }
+                    if (dragging) {
+                        p.x = (px + dx).toInt().coerceIn(0, (resources.displayMetrics.widthPixels - charW).coerceAtLeast(0))
+                        p.y = (py + dy).toInt().coerceIn(0, (resources.displayMetrics.heightPixels - charH).coerceAtLeast(0))
                         runCatching { wm.updateViewLayout(v, p) }
+                        val dtMs = (e.eventTime - lt).coerceAtLeast(1L)
+                        // сглаживание: палец дёргается, а Тук должен лететь плавно
+                        vx = vx * 0.6f + 0.4f * ((e.rawX - lx) / dp) * 1000f / dtMs
+                        vy = vy * 0.6f + 0.4f * ((e.rawY - ly) / dp) * 1000f / dtMs
+                        lx = e.rawX; ly = e.rawY; lt = e.eventTime
+                        if (e.eventTime - flySent > 32) {
+                            flySent = e.eventTime
+                            web?.fly(vx, vy)
+                        }
                     }
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    if (v.dragging) {
+                    if (dragging) {
                         prefs.edit().putInt("x", p.x).putInt("y", p.y).apply()
-                        v.dragging = false
-                        val cancel = MotionEvent.obtain(e)
-                        cancel.action = MotionEvent.ACTION_CANCEL
-                        gd.onTouchEvent(cancel)
-                        cancel.recycle()
+                        dragging = false
+                        (v as? IslandView)?.dragging = false
+                        web?.land()
+                        cancelGesture(e)
                         return@setOnTouchListener true
                     }
                 }
             }
-            if (v.dragging) {
-                val cancel = MotionEvent.obtain(e)
-                cancel.action = MotionEvent.ACTION_CANCEL
-                gd.onTouchEvent(cancel)
-                cancel.recycle()
+            if (dragging) {
+                cancelGesture(e)
                 true
-            } else gd.onTouchEvent(e)
+            } else {
+                gd.onTouchEvent(e)
+                // касания WebView не нужны: всё решает сервис
+                true
+            }
         }
         view = v
+        web = w
         params = p
-        wm.addView(v, p)
+        try {
+            wm.addView(v, p)
+        } catch (e: Exception) {
+            view = null
+            web?.destroy()
+            web = null
+            if (w != null) {
+                // окно с WebView не добавилось — пробуем нативный остров
+                webBroken = true
+                addView()
+            }
+        }
+    }
+
+    /** Страница посчитала облачко: окно = персонаж + облачко (dp → px). */
+    private fun onWebWidth(cssWidth: Int) {
+        main.post {
+            val v = view ?: return@post
+            val p = params ?: return@post
+            if (web == null) return@post
+            val wpx = (cssWidth.coerceIn(IslandWeb.CHAR_W_DP, IslandWeb.CHAR_W_DP + 240) * dp).toInt()
+            if (p.width == wpx) return@post
+            p.width = wpx
+            // облачко у правого края — Тук не уезжает, окно растёт вправо, но не за экран
+            runCatching { wm.updateViewLayout(v, p) }
+        }
+    }
+
+    /** WebView упал или не загрузил страницу — переходим на нативный остров. */
+    private fun onWebFailed() {
+        main.post {
+            if (web == null) return@post
+            webBroken = true
+            removeView()
+            if (show) addView()
+            refresh()
+        }
     }
 
     fun reloadSprite(mood: String) {
-        main.post { view?.forget(mood); refresh() }
+        main.post { (view as? IslandView)?.forget(mood); refresh() }
+    }
+
+    /** Наряд и цвета поменялись в приложении — перерисовать живого Тука. */
+    fun reloadLook() {
+        refresh()
+    }
+
+    private val awayDone = Runnable {
+        // «уходит в фон» — короткая анимация, дальше Тук просто рядом
+        if (Island.mood == "away") {
+            Island.mood = "idle"
+            refresh()
+        }
     }
 
     fun refresh() {
         main.post {
             val v = view ?: return@post
+            val m = Island.wakeMood ?: Island.mood
+            if (m != lastMood) {
+                lastMood = m
+                main.removeCallbacks(awayDone)
+                if (m == "away") main.postDelayed(awayDone, 1800)
+            }
             // остров прячется, пока открыто приложение (кроме момента, когда Тук слушает «Тук Тук»)
             v.visibility = if (Island.appVisible) View.GONE else View.VISIBLE
-            v.update()
+            val w = web
+            if (w != null) {
+                w.state(m, Island.wakeText ?: Island.text, Island.badge, Island.look)
+                // экономия батареи: экран выключен или Тук спрятан — кадры не рисуем
+                w.pause(!screenOn || Island.appVisible)
+            } else {
+                (v as? IslandView)?.let {
+                    it.paused = !screenOn || Island.appVisible
+                    it.update()
+                }
+            }
         }
     }
 }
 
-/** Тук в полный рост поверх приложений; облачко с текстом — только когда есть что сказать. */
+/**
+ * Живой Тук: прозрачный WebView со страницей island-android.html (класс Character, пружины, 60 к/с).
+ * Страница и её модули лежат в assets/island плагина и отдаются по https://tuk.island/ —
+ * ES-модули с file:// Chromium не грузит.
+ */
+@SuppressLint("SetJavaScriptEnabled")
+class IslandWeb(
+    private val ctx: Context,
+    private val onWidth: (Int) -> Unit,
+    private val onFailed: () -> Unit
+) {
+    companion object {
+        /** Персонаж, dp — совпадает с #tuk в island-android.html. */
+        const val CHAR_W_DP = 80
+        const val CHAR_H_DP = 64
+        private const val HOST = "tuk.island"
+        private const val START = "https://$HOST/island-android.html"
+    }
+
+    private val main = Handler(Looper.getMainLooper())
+    val view: WebView = WebView(ctx)
+    private var ready = false
+    private var lastState = ""
+    private var paused: Boolean? = null
+    private var dead = false
+    /** Страница не ответила ready() — WebView сломан, нужен нативный остров. */
+    private val watchdog: Runnable = object : Runnable {
+        override fun run() {
+            if (ready || dead) return
+            // спрятанный остров мог не успеть — подождать, пока его покажут
+            if (view.isShown) onFailed() else main.postDelayed(this, 8000)
+        }
+    }
+
+    init {
+        view.setBackgroundColor(Color.TRANSPARENT)
+        view.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        view.isVerticalScrollBarEnabled = false
+        view.isHorizontalScrollBarEnabled = false
+        view.overScrollMode = View.OVER_SCROLL_NEVER
+        view.isFocusable = false
+        view.isFocusableInTouchMode = false
+        view.isLongClickable = false
+        view.isHapticFeedbackEnabled = false
+        view.setOnLongClickListener { true }
+        if (Build.VERSION.SDK_INT >= 26) view.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+        val s = view.settings
+        s.javaScriptEnabled = true
+        s.domStorageEnabled = false
+        s.allowFileAccess = false
+        s.allowContentAccess = false
+        s.textZoom = 100
+        s.setSupportZoom(false)
+        s.builtInZoomControls = false
+        s.displayZoomControls = false
+        s.mediaPlaybackRequiresUserGesture = true
+        s.cacheMode = WebSettings.LOAD_NO_CACHE
+        view.addJavascriptInterface(Bridge(), "TukBridge")
+        view.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(v: WebView, req: WebResourceRequest): WebResourceResponse? {
+                val u = req.url
+                if (u.host != HOST) return empty(404)
+                val name = (u.path ?: "").trimStart('/')
+                // только плоские имена из assets/island — никаких «../»
+                if (name.isEmpty() || name.contains('/') || name.contains("..")) return empty(404)
+                val mime = when {
+                    name.endsWith(".html") -> "text/html"
+                    name.endsWith(".js") -> "text/javascript"
+                    name.endsWith(".css") -> "text/css"
+                    else -> "application/octet-stream"
+                }
+                return try {
+                    WebResourceResponse(mime, "utf-8", ctx.assets.open("island/$name"))
+                } catch (e: Exception) {
+                    empty(404)
+                }
+            }
+
+            override fun shouldOverrideUrlLoading(v: WebView, req: WebResourceRequest): Boolean = true
+
+            @SuppressLint("NewApi")
+            override fun onRenderProcessGone(v: WebView, detail: RenderProcessGoneDetail): Boolean {
+                // рендерер упал (или его убила система ради памяти) — без этого упадёт всё приложение
+                dead = true
+                onFailed()
+                return true
+            }
+        }
+        view.loadUrl(START)
+        main.postDelayed(watchdog, 8000)
+    }
+
+    private fun empty(code: Int): WebResourceResponse =
+        WebResourceResponse("text/plain", "utf-8", code, "Not Found", emptyMap(), ByteArrayInputStream(ByteArray(0)))
+
+    /** Мост для страницы; методы вызываются из потока JavaBridge, а не из главного. */
+    // класс открытый: WebView ищет методы через отражение
+    inner class Bridge {
+        @JavascriptInterface
+        fun ready() {
+            main.post {
+                if (dead) return@post
+                ready = true
+                main.removeCallbacks(watchdog)
+                // страница могла перезагрузиться — прислать всё заново
+                if (lastState.isNotEmpty()) js("window.tukIsland&&tukIsland.state($lastState)")
+                val pz = paused
+                paused = null
+                if (pz != null) pause(pz)
+            }
+        }
+
+        @JavascriptInterface
+        fun bubble(cssWidth: Int) {
+            onWidth(cssWidth)
+        }
+    }
+
+    private fun js(code: String) {
+        if (!ready || dead) return
+        runCatching { view.evaluateJavascript(code, null) }
+    }
+
+    /** Настроение, облачко, значок и наряд (JSON из приложения). Шлём только изменения. */
+    fun state(mood: String, text: String, badge: Int, look: String?) {
+        val o = JSONObject()
+        o.put("mood", mood)
+        o.put("text", text)
+        o.put("badge", badge)
+        if (look != null) runCatching { o.put("look", JSONObject(look)) }
+        val st = o.toString()
+        if (st == lastState) return
+        lastState = st
+        js("window.tukIsland&&tukIsland.state($st)")
+    }
+
+    fun pause(on: Boolean) {
+        if (paused == on) return
+        paused = on
+        // до загрузки страницы только запоминаем: ready() применит
+        if (!ready || dead) return
+        js("window.tukIsland&&tukIsland.pause($on)")
+        // и сам WebView (pauseTimers не трогаем — он общий с WebView приложения)
+        runCatching { if (on) view.onPause() else view.onResume() }
+    }
+
+    fun tap() = js("window.tukIsland&&tukIsland.tap()")
+
+    fun fly(vx: Float, vy: Float) {
+        if (vx.isNaN() || vy.isNaN()) return
+        js("window.tukIsland&&tukIsland.fly(${vx.toInt()},${vy.toInt()})")
+    }
+
+    fun land() = js("window.tukIsland&&tukIsland.land()")
+
+    fun destroy() {
+        dead = true
+        main.removeCallbacks(watchdog)
+        runCatching {
+            view.stopLoading()
+            view.removeJavascriptInterface("TukBridge")
+            view.destroy()
+        }
+    }
+}
+
+/**
+ * Запасной нативный остров (готовые кадры из Character.sheet), если WebView недоступен.
+ * Облачко с текстом — только когда есть что сказать.
+ */
 class IslandView(ctx: Context) : View(ctx) {
     private val dp = resources.displayMetrics.density
     val charH = (64 * dp).toInt()
@@ -297,13 +631,19 @@ class IslandView(ctx: Context) : View(ctx) {
     private var textW = 0
     private var bounceUntil = 0L
     private var lastMood = ""
-    private var moodSince = 0L
     private val ticker = Handler(Looper.getMainLooper())
+    /** Экран выключен или Тук спрятан — кадры не крутим. */
+    var paused = false
+        set(on) {
+            if (field == on) return
+            field = on
+            ticker.removeCallbacks(tick)
+            if (!on && isAttachedToWindow) ticker.post(tick)
+        }
     private val tick = object : Runnable {
         override fun run() {
+            if (paused) return
             frame++
-            // «уходит в фон» — короткая анимация, дальше Тук просто рядом
-            if (Island.mood == "away" && System.currentTimeMillis() - moodSince > 1800) Island.mood = "idle"
             invalidate()
             val fps = sprite(mood())?.second?.get(1) ?: 8
             ticker.postDelayed(this, (1000 / fps.coerceIn(2, 30)).toLong())
@@ -315,7 +655,7 @@ class IslandView(ctx: Context) : View(ctx) {
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        ticker.post(tick)
+        if (!paused) ticker.post(tick)
     }
 
     override fun onDetachedFromWindow() {
@@ -348,7 +688,6 @@ class IslandView(ctx: Context) : View(ctx) {
         val m = mood()
         if (m != lastMood) {
             lastMood = m
-            moodSince = System.currentTimeMillis()
             frame = 0
         }
         val t = text()

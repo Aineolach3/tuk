@@ -401,7 +401,7 @@ export interface IslandArgs {
   wake?: boolean;
 }
 
-/** Остров поверх приложений: check | grant | config | download | update | sprite | consume | back. */
+/** Остров поверх приложений: check | grant | config | download | update | sprite | look | consume | back. */
 export async function island(action: string, args: IslandArgs = {}): Promise<any> {
   if (kind !== 'android') return null;
   return invoke('plugin:tuk|island', { action, ...args });

@@ -1583,6 +1583,7 @@ class App {
   /** Кадры анимации для острова — рисуются тем же кодом, в текущем наряде. */
   async sendSprites(): Promise<void> {
     const look = { outfit: this.char.outfit, hood: this.char.hood, light: this.char.idleLight };
+    void P.island('look', { data: JSON.stringify(look) }).catch(() => {}); // живой Тук на острове
     const key = JSON.stringify(look) + ISLAND_SPRITE_VERSION;
     if (this.store.data.islandLook === key || this.spritesBusy) return;
     this.spritesBusy = true;
