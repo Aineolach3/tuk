@@ -531,7 +531,13 @@ pub fn run() {
                 }
                 island::spawn_poll(handle.clone(), isl);
 
-                // Питомец: окно создано из tauri.conf.json, ждёт за краем экрана
+                // Питомец: описан в tauri.conf.json с "create": false — создаём только на ПК,
+                // иначе Android открывает это окно вместо приложения (Тук во весь экран)
+                if app.get_webview_window(desktop::PET).is_none() {
+                    if let Some(cfg) = app.config().app.windows.iter().find(|c| c.label == desktop::PET).cloned() {
+                        let _ = tauri::WebviewWindowBuilder::from_config(app, &cfg).and_then(|b| b.build());
+                    }
+                }
                 if let Some(w) = app.get_webview_window(desktop::PET) {
                     make_transparent(&w);
                 }

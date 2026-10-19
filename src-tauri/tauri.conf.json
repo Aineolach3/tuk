@@ -51,7 +51,8 @@
         "center": false,
         "focus": false,
         "visible": true,
-        "dragDropEnabled": true
+        "dragDropEnabled": true,
+        "create": false
       }
     ],
     "security": {

@@ -2876,7 +2876,7 @@ class App {
 }
 
 async function main() {
-  if (P.windowLabel() === 'pet') return runPet();
+  if (P.windowLabel() === 'pet' && P.kind === 'desktop') return runPet();
   let data: Data | null = null;
   try {
     const raw = await P.loadData();
