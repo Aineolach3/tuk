@@ -2,9 +2,10 @@
 
 import { Character, HOOD_COLORS, LIGHT_COLORS, MOOD_LABEL, OUTFIT_LABEL, seasonalOutfit, type Mood, type Outfit } from './character.js';
 import { play, setVolume, type Sound } from './sounds.js';
-import { MAX_CHARS, readFile, type FileText } from './files.js';
+import { KIND_ICON, MAX_CHARS, describe, extractTasks, filesContext, fitBudget, fmtSize, noteFromFile, readFile, truncationNote, type FileCard } from './files.js';
+import { LOCAL_PRESETS, isLocalUrl, listModels, localChat } from './localai.js';
 import { computeRecap, renderRecap } from './recap.js';
-import { AgentHub, KIND_LABEL, hooksInstalled, installHooks, uninstallHooks, type HubEvent, type Pending, type Session } from './agents.js';
+import { AgentHub, KIND_LABEL, STATUS_LABEL, demoScript, duration, hooksInstalled, installHooks, uninstallHooks, type HubEvent, type Pending, type Session } from './agents.js';
 import { runPet, type PetState } from './pet.js';
 import { METRIC_LABEL, healthText, type Item, type Metric } from './model.js';
 import { REPEAT_LABEL, fmtDay, fmtTime, fmtWhen, normalize, parse } from './parser.js';
@@ -37,7 +38,21 @@ const ISLAND_FRAME: [number, number] = [170, 136];
 const ISLAND_SPRITE_VERSION = ':3';
 import { Brain, MODELS, systemPrompt, type BrainState, type ChatMsg, type ModelId } from './brain.js';
 
+/** Файл из Проводника: путь, имя и содержимое base64 (если не больше 50 МБ). */
+interface DroppedFile {
+  name?: string;
+  path?: string;
+  data?: string;
+  size?: number;
+}
+
 type Tab = 'today' | 'chat' | 'tasks' | 'reminders' | 'health' | 'notes' | 'agents' | 'settings';
+/** Разделы ⚙ — всё, что умеет Тук, разложено по понятным группам. */
+type SetSec = 'main' | 'look' | 'brain' | 'link' | 'agents' | 'device' | 'help';
+const SET_SECTIONS: [SetSec, string][] = [
+  ['main', 'Основное'], ['look', 'Внешний вид'], ['brain', 'Мозг'], ['link', 'Связь'], ['agents', 'Агенты'], ['device', P.kind === 'android' ? 'Телефон' : 'Компьютер'], ['help', 'Справка и демо'],
+];
+const TAB_ORDER: Tab[] = ['today', 'chat', 'tasks', 'reminders', 'health', 'notes', 'agents', 'settings'];
 
 const $ = <T extends HTMLElement = HTMLElement>(s: string) => document.querySelector(s) as T;
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
@@ -69,7 +84,13 @@ class App {
   chatAbort: AbortController | null = null;
   lastBrainRender = 0;
   pokes: number[] = [];
-  file: FileText | null = null; // прикреплённый файл для разговора
+  files: FileCard[] = []; // прикреплённые файлы для разговора, заметок и задач
+  setSec: SetSec = 'main';
+  /** Выбранные варианты в вопросах агентов: reqId → вопрос → варианты. */
+  qSel = new Map<number, Record<string, string[]>>();
+  demo: { timers: ReturnType<typeof setTimeout>[]; hub: AgentHub } | null = null;
+  onboardStep = 0;
+  localModels: string[] = [];
   lastBase: Mood = 'idle';
   hub: AgentHub;
   remote: { sessions: Session[]; pending: Pending[] } | null = null;
@@ -109,10 +130,16 @@ class App {
       },
     );
     this.hub.onChange = () => this.renderAgents();
-    this.hub.onEvent = (e) => this.onAgentEvent(e);
+    this.hub.onEvent = (e) => {
+      // настоящий запрос важнее демо: выходим, чтобы его не спрятать
+      if (this.demo && e.type === 'permission') this.stopDemo(true);
+      this.onAgentEvent(e);
+    };
     this.link.hookHandler = (id, body) => this.hub.handle(id, body);
     this.link.agentsHandler = () => this.hub.snapshot();
     this.link.decideHandler = (reqId, d) => this.hub.decide(reqId, d);
+    this.link.answerHandler = (reqId, a) => this.hub.answer(reqId, a);
+    this.link.closeHandler = (id) => this.hub.close(id);
     st.outfit ??= 'auto';
     st.hoodColor ??= 'Чёрный';
     this.char = new Character($<HTMLCanvasElement>('#char'));
@@ -146,8 +173,11 @@ class App {
       await P.listen('pet-poke', () => this.poke());
       await P.listen('pet-menu', () => {
         this.applyMode('expanded');
+        this.setSec = 'look';
         this.setTab('settings');
       });
+      // файлы из Проводника (нативный drag & drop Tauri): [{ name, path, data? (base64), size? }]
+      await P.listen('files-drop', (payload: { files?: DroppedFile[] } | DroppedFile[]) => void this.takeDropped(Array.isArray(payload) ? payload : payload?.files ?? []));
       void this.checkClaude();
     } else if (P.kind === 'android') {
       this.link.startClient();
@@ -198,12 +228,15 @@ class App {
     await P.listen('toggle', () => this.toggleFromShortcut());
     await P.listen('open-link', () => {
       this.applyMode('expanded');
+      this.setSec = 'link';
       this.setTab('settings');
     });
     await P.setAutostart(this.store.data.settings.autostart);
     this.flash('wave', 2400);
     this.sfx('hello');
-    if (!this.store.items.length) this.say('Привет! Я Тук. Напишите, что записать или о чём напомнить.', null, 4000);
+    if (!this.store.data.settings.onboarded) setTimeout(() => this.renderOnboarding(), 900);
+    else if (!this.store.items.length) this.say('Привет! Я Тук. Напишите, что записать или о чём напомнить.', null, 4000);
+    this.renderAgents();
   }
 
   // ---------------- Настроение ----------------
@@ -290,6 +323,9 @@ class App {
       if (P.kind === 'desktop' && this.mode === 'compact' && !R.ringing(this.store).length && !this.hovering) this.applyMode('collapsed');
     }
     if (now % 15000 < 1000) this.renderBar();
+    this.hub.autoClean = this.store.data.settings.agentAutoClean !== false;
+    if (P.kind === 'desktop') this.hub.sweep(now);
+    this.demo?.hub.sweep(now);
     this.pushIsland();
   }
 
@@ -402,7 +438,9 @@ class App {
         this.say(`Привет! ${this.summary()}`, 'happy', 3000);
         break;
       case 'help':
-        this.say('Например: «напомни завтра в 9 позвонить», «запиши купить кабель», «давление 125 на 80», «готово кабель».', 'help', 9000);
+        this.say('Например: «напомни завтра в 9 позвонить», «запиши купить кабель», «давление 125 на 80», «готово кабель». Файлы — 📎 или перетащите. Всё, что я умею, — в ⚙ → «Справка и демо».', 'help', 9000);
+        this.setSec = 'help';
+        this.setTab('settings');
         break;
     }
   }
@@ -411,7 +449,13 @@ class App {
 
   /** Есть ли чем думать: свой мозг или мозг ПК (для телефона). */
   canTalk(): boolean {
-    return this.brain.ready || (P.kind === 'android' && this.link.linked && !!this.store.data.settings.usePcBrain);
+    return this.brain.ready || this.localOn() || (P.kind === 'android' && this.link.linked && !!this.store.data.settings.usePcBrain);
+  }
+
+  /** Включён ли мозг из Ollama / LM Studio. */
+  localOn(): boolean {
+    const l = this.store.data.settings.localAi;
+    return !!l?.on && !!l.model && isLocalUrl(l.url);
   }
 
   contextText(): string {
@@ -444,13 +488,13 @@ class App {
     this.setTab('chat');
 
     let ctxText = this.contextText();
-    if (this.file) ctxText += `\n\nПрикреплённый файл «${this.file.name}»${this.file.truncated ? ' (начало)' : ''}:\n-----\n${this.file.text}\n-----\nОтвечай на вопросы о нём по его содержанию.`;
-    const history = chat.slice(this.file ? -6 : -12).map((m) => ({ role: m.role, content: m.content }));
+    if (this.files.length) ctxText += '\n\n' + filesContext(this.files);
+    const history = chat.slice(this.files.length ? -6 : -12).map((m) => ({ role: m.role, content: m.content }));
     const messages: ChatMsg[] = [{ role: 'system', content: systemPrompt(d.settings.name, ctxText) }, ...history];
     this.generating = true;
     this.streamText = '';
     this.chatAbort = new AbortController();
-    const look: Mood = this.file ? 'search' : 'think'; // с файлом — «ищет» в нём
+    const look: Mood = this.files.length ? 'search' : 'think'; // с файлом — «ищет» в нём
     this.tempMood = look;
     this.tempUntil = Date.now() + 600_000;
     this.char.set(look);
@@ -462,19 +506,24 @@ class App {
         try {
           answer = await this.link.askPc(messages);
         } catch (e) {
-          if (!this.brain.ready) throw new Error('ПК не ответил, а своего мозга на телефоне пока нет. Скачайте его во вкладке «Чат».');
+          if (!this.brain.ready && !this.localOn()) throw new Error('ПК не ответил, а своего мозга на телефоне пока нет. Скачайте его во вкладке «Чат».');
+        }
+      }
+      const onText = (full: string) => {
+        if (!this.streamText) this.flash('work', 600_000);
+        this.streamText = full;
+        this.renderChatLive();
+      };
+      if (!answer && this.localOn() && (!pcFirst || !this.brain.ready)) {
+        try {
+          answer = await localChat(d.settings.localAi!, messages, onText, this.chatAbort.signal);
+        } catch (e) {
+          if (!this.brain.ready || this.chatAbort.signal.aborted) throw e;
         }
       }
       if (!answer) {
-        answer = await this.brain.chat(
-          messages,
-          (full) => {
-            if (!this.streamText) this.flash('work', 600_000);
-            this.streamText = full;
-            this.renderChatLive();
-          },
-          this.chatAbort.signal,
-        );
+        if (!this.brain.ready) throw new Error('Мозг ещё не загружен — скачайте его в ⚙ → «Мозг» или подключите Ollama / LM Studio.');
+        answer = await this.brain.chat(messages, onText, this.chatAbort.signal);
       }
       answer = answer.trim() || '…';
       chat.push({ role: 'assistant', content: answer, ts: Date.now() });
@@ -568,14 +617,14 @@ class App {
 
   chatHtml(): string {
     const chat = this.store.data.chat ?? [];
-    const head = this.brain.ready ? '' : this.canTalk() ? '<p class="muted small">Отвечает мозг ПК. Свой мозг на телефоне можно скачать в ⚙.</p>' : this.brainHtml();
+    const head = (this.brain.ready ? '' : this.localOn() ? `<p class="muted small">Отвечает локальный сервер: ${esc(this.store.data.settings.localAi!.model)}.</p>` : this.canTalk() ? '<p class="muted small">Отвечает мозг ПК. Свой мозг на телефоне можно скачать в ⚙.</p>' : this.brainHtml()) + this.filesHtml();
     const bubbles = chat
       .slice(-40)
       .map((m) => `<div class="msg ${m.role === 'user' ? 'me' : 'tuk'}">${esc(m.content)}</div>`)
       .join('');
     const live = this.generating ? `<div class="msg tuk live" id="stream-bubble">${esc(this.streamText || '…')}</div>` : '';
-    const empty = !chat.length && !this.generating
-      ? `<p class="muted">Просто напишите что-нибудь: «как дела?», «что у меня завтра?», «посоветуй, с чего начать день». Команды вроде «напомни…» и «запиши…» работают как раньше.</p>`
+    const empty = !chat.length && !this.generating && !this.files.length
+      ? `<p class="muted">Перетащите сюда файлы (txt, PDF, Word, Excel, картинки) или нажмите 📎 — и спросите о них. Или просто напишите что-нибудь: «как дела?», «что у меня завтра?», «посоветуй, с чего начать день». Команды вроде «напомни…» и «запиши…» работают как раньше.</p>`
       : '';
     const tools = this.generating
       ? '<button class="pill ghost small" data-act="chat-stop">Остановить</button>'
@@ -668,33 +717,131 @@ class App {
 
   // ---------------- Файлы ----------------
 
-  async takeFile(f: File): Promise<void> {
+  /** Принять файлы (скрепка, перетаскивание, Проводник). Сразу несколько. */
+  async takeFiles(list: File[], paths: (string | undefined)[] = []): Promise<void> {
+    if (!list.length) return;
     this.activity();
     if (P.kind === 'desktop' && this.mode !== 'expanded') this.applyMode('expanded');
     this.flash('eat', 1400);
     this.sfx('eat');
-    try {
-      setTimeout(() => this.tempMood === 'eat' && this.flash('search', 2500), 1300);
-      this.file = await readFile(f);
-      const pages = this.file.pages ? ` (${this.file.pages} стр.)` : '';
-      const cut = this.file.truncated ? ` Прочитал первые ${MAX_CHARS} символов — больше в мою голову не влезет.` : '';
-      this.renderFileChip();
-      if (this.canTalk()) {
-        this.setTab('chat');
-        this.say(`Проглотил «${this.file.name}»${pages}.${cut} Спросите, что в нём — например, «перескажи коротко».`, null, 7000);
-      } else this.say(`Прочитал «${this.file.name}», но чтобы обсудить его, мне нужен мозг — вкладка «Чат».`, 'think', 6000);
-    } catch (e) {
-      this.file = null;
-      this.renderFileChip();
-      this.sfx('error');
-      this.say(String((e as Error).message ?? e), 'think', 5000);
+    setTimeout(() => this.tempMood === 'eat' && this.flash('search', 2500), 1300);
+    const room = 8 - this.files.length;
+    if (room <= 0) return this.say('Уже держу 8 файлов — уберите лишние, чтобы добавить новые.', 'think', 5000);
+    if (list.length > room) this.say(`Возьму только ${room} из ${list.length} — больше 8 файлов сразу не удержу.`, 'think', 4000);
+    const fresh: FileCard[] = [];
+    for (let i = 0; i < Math.min(room, list.length); i++) fresh.push(await readFile(list[i], paths[i]));
+    this.files.push(...fresh);
+    fitBudget(this.files, MAX_CHARS);
+    this.renderFileChip();
+    this.setTab('chat');
+    const names = fresh.length === 1 ? `«${fresh[0].name}»` : `${fresh.length} файла(ов)`;
+    const cut = this.files.filter((c) => c.truncated);
+    const bad = fresh.filter((c) => c.note && !c.full && c.kind !== 'image');
+    let msg = `Проглотил ${names}.`;
+    if (cut.length) msg += ` Текста много — мозгу уйдёт только начало ${cut.length === 1 ? `«${cut[0].name}»` : `${cut.length} файлов`}.`;
+    if (bad.length === fresh.length) msg = `${names}: ${bad[0].note}`;
+    else msg += this.canTalk() ? ' Спросите о содержимом или сделайте из файла заметку или задачи — кнопки во вкладке «Чат».' : ' Сделать заметку или задачи можно сразу, а чтобы спрашивать — нужен мозг (⚙ → «Мозг»).';
+    this.say(msg, bad.length === fresh.length ? 'think' : null, 7000);
+    if (bad.length === fresh.length) this.sfx('error');
+  }
+
+  /** Файлы, брошенные из Проводника на остров или питомца: содержимое приходит base64 от Rust. */
+  async takeDropped(list: DroppedFile[]): Promise<void> {
+    const files: File[] = [];
+    const paths: (string | undefined)[] = [];
+    for (const d of list) {
+      const name = d.name || d.path?.split(/[\\/]/).pop() || 'файл';
+      let bytes = new Uint8Array(0);
+      if (d.data) {
+        const bin = atob(d.data);
+        bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      }
+      const f = new File([bytes as BlobPart], name);
+      // без содержимого (слишком большой) — карточка с настоящим размером
+      if (!d.data && d.size) Object.defineProperty(f, 'size', { value: d.size });
+      files.push(f);
+      paths.push(d.path);
     }
+    return this.takeFiles(files, paths);
+  }
+
+  /** Совместимость: один файл. */
+  takeFile(f: File): Promise<void> {
+    return this.takeFiles([f]);
+  }
+
+  dropFile(id: string): void {
+    const c = this.files.find((x) => x.id === id);
+    if (c?.preview?.startsWith('blob:')) URL.revokeObjectURL(c.preview);
+    this.files = id ? this.files.filter((x) => x.id !== id) : [];
+    fitBudget(this.files, MAX_CHARS);
+    this.renderFileChip();
+    this.lastHtml = '';
+    this.render();
   }
 
   renderFileChip(): void {
     const el = $('#file-chip');
-    el.hidden = !this.file;
-    if (this.file) el.innerHTML = `<span>📎 ${esc(this.file.name)}</span><button data-act="file-drop" aria-label="Убрать файл">×</button>`;
+    el.hidden = !this.files.length;
+    if (!this.files.length) return void (el.innerHTML = '');
+    const one = this.files.length === 1 ? this.files[0] : null;
+    const label = one ? `${KIND_ICON[one.kind]} ${esc(one.name)}` : `📎 ${this.files.length} файла(ов): ${esc(this.files.map((c) => c.name).join(', '))}`;
+    el.innerHTML = `<span title="Файлы для разговора">${label}${this.files.some((c) => c.truncated) ? ' <i class="muted">· обрезано</i>' : ''}</span><button data-act="tab" data-id="chat" aria-label="Показать файлы">⋯</button><button data-act="file-drop" data-id="" aria-label="Убрать все файлы">×</button>`;
+  }
+
+  /** Карточки файлов во вкладке «Чат»: превью, размер, обрезка, действия. */
+  filesHtml(): string {
+    if (!this.files.length) return '';
+    const cards = this.files
+      .map((c) => {
+        const thumb = c.preview ? `<img class="fthumb" src="${esc(c.preview)}" alt="">` : `<div class="fthumb ficon">${KIND_ICON[c.kind]}</div>`;
+        const cut = truncationNote(c);
+        const tasks = c.full ? extractTasks(c.full).length : 0;
+        const desk = P.kind === 'desktop' && c.path;
+        return `<li class="item fcard">${thumb}<div class="body"><div class="t">${esc(c.name)}</div><div class="m">${esc(describe(c))}</div>
+          ${c.note ? `<div class="m">${esc(c.note)}</div>` : ''}${cut ? `<div class="m warn-t">✂ ${esc(cut)}</div>` : ''}
+          <div class="row">${c.full ? `<button class="pill ghost small" data-act="file-ask" data-id="${c.id}">Перескажи</button><button class="pill ghost small" data-act="file-note" data-id="${c.id}">В заметки</button><button class="pill ghost small" data-act="file-tasks" data-id="${c.id}">${tasks ? `Задачи (${tasks})` : 'Сделать задачей'}</button>` : `<button class="pill ghost small" data-act="file-note" data-id="${c.id}">Запомнить файл</button>`}
+          ${desk ? `<button class="pill ghost small" data-act="file-open" data-id="${c.id}">Открыть</button><button class="pill ghost small" data-act="file-folder" data-id="${c.id}">Показать в папке</button>` : ''}</div></div>
+          <button class="x" data-act="file-drop" data-id="${c.id}" aria-label="Убрать файл">×</button></li>`;
+      })
+      .join('');
+    const total = this.files.reduce((a, c) => a + c.size, 0);
+    return `<h3>Файлы · ${this.files.length} · ${fmtSize(total)}</h3><ul>${cards}</ul><p class="muted small">Спросите в строке ввода: «что в этих файлах?», «сравни таблицы», «найди сроки». Мозгу уходит до ${MAX_CHARS.toLocaleString('ru-RU')} символов на все файлы вместе.</p>`;
+  }
+
+  async fileAction(act: string, id: string): Promise<void> {
+    const c = this.files.find((x) => x.id === id);
+    if (!c) return;
+    const s = this.store;
+    switch (act) {
+      case 'file-ask':
+        if (!this.canTalk()) return this.say('Чтобы пересказать, нужен мозг: ⚙ → «Мозг» (или Ollama / LM Studio).', 'think', 5000);
+        return this.converse(`Перескажи коротко, о чём файл «${c.name}», и выдели главное.`);
+      case 'file-note':
+        s.add({ kind: 'note', text: noteFromFile(c) });
+        this.sfx('write');
+        return this.say(`Сохранил «${c.name}» в заметки.`, 'write', 2500);
+      case 'file-tasks': {
+        const list = c.full ? extractTasks(c.full) : [];
+        if (!list.length) {
+          s.add({ kind: 'task', text: `Разобрать файл «${c.name}»`, dueAt: null, allDay: false });
+          this.sfx('write');
+          return this.say(`Пунктов-дел в файле не нашёл — записал задачу «Разобрать файл «${c.name}»».`, 'write', 4000);
+        }
+        for (const t of list) s.add({ kind: 'task', text: t, dueAt: null, allDay: false });
+        this.sfx('write');
+        return this.say(`Записал ${list.length} задач(и) из «${c.name}» — они во вкладке «Дела».`, 'write', 4000);
+      }
+      case 'file-open':
+      case 'file-folder':
+        if (!c.path) return;
+        try {
+          await P.openTarget(act === 'file-open' ? c.path : c.path.replace(/[\\/][^\\/]*$/, ''));
+        } catch (e) {
+          this.say('Не получилось открыть: ' + String((e as Error).message ?? e), 'think', 4000);
+        }
+    }
   }
 
   // ---------------- Недельная сводка ----------------
@@ -734,34 +881,55 @@ class App {
 
   // ---------------- Агенты (Claude Code) ----------------
 
+  /** Хаб, с которым работаем: демо-сценарий или настоящий. */
+  get agentHub(): AgentHub {
+    return this.demo?.hub ?? this.hub;
+  }
+
   agentSessions(): Session[] {
+    if (this.demo) return this.demo.hub.active;
     return P.kind === 'desktop' ? this.hub.active : this.remote?.sessions ?? [];
   }
 
   agentPending(): Pending[] {
+    if (this.demo) return this.demo.hub.pending;
     return P.kind === 'desktop' ? this.hub.pending : this.remote?.pending ?? [];
+  }
+
+  /** Решения принимает этот компьютер (или демо), а не телефон через ПК. */
+  get agentsLocal(): boolean {
+    return !!this.demo || P.kind === 'desktop';
   }
 
   onAgentEvent(e: HubEvent): void {
     const name = this.store.data.settings.name;
+    const quiet = !!this.demo; // в демо — без системных уведомлений
     if (e.type === 'permission') {
       this.sfx('alert');
       this.flash('alert', 4000);
       if (P.kind === 'desktop' && this.mode === 'collapsed') this.applyMode('compact');
-      void P.notify(`${name}: Claude Code просит разрешения`, `${e.p.tool}: ${e.p.summary}`);
+      const what = e.p.questions ? `${e.p.agent ?? 'Claude'} спрашивает` : `${e.p.agent ?? 'Claude Code'} просит разрешения`;
+      if (!quiet) void P.notify(`${name}: ${what} · ${e.p.project}`, e.p.questions ? e.p.questions[0].question : `${e.p.tool}: ${e.p.summary}`);
     } else if (e.type === 'done') {
       this.flash('happy', 2500);
       this.sfx('done');
-      void P.notify(`${name}: Claude закончил`, `Проект «${e.s.project}»`);
+      if (!quiet) void P.notify(`${name}: ${e.s.agent} закончил`, `Проект «${e.s.project}»${e.s.plus || e.s.minus ? ` · +${e.s.plus} −${e.s.minus}` : ''}`);
+    } else if (e.type === 'error') {
+      this.sfx('error');
+      if (!quiet) void P.notify(`${name}: ${e.s.agent} — ошибка`, `Проект «${e.s.project}»`);
     } else if (e.type === 'waiting') {
-      void P.notify(`${name}: Claude ждёт вас`, e.message);
+      if (!quiet) void P.notify(`${name}: ${e.s.agent} ждёт вас`, e.message);
     }
     this.renderAgents();
   }
 
   renderAgents(): void {
-    const has = this.agentSessions().length > 0 || this.agentPending().length > 0 || (P.kind === 'desktop' && !!this.claudeHooks);
-    $('#tab-agents').hidden = !has;
+    // вкладка «Агенты» видна всегда — раньше она пряталась, пока не подключён Claude Code
+    const n = this.agentPending().length;
+    const tab = $('#tab-agents');
+    tab.hidden = false;
+    tab.textContent = n ? `Агенты · ${n}` : this.agentSessions().length ? `Агенты · ${this.agentSessions().length}` : 'Агенты';
+    tab.classList.toggle('attn', n > 0);
     this.renderBar();
     if (this.tab === 'agents') {
       this.lastHtml = '';
@@ -770,10 +938,10 @@ class App {
   }
 
   async decideAgent(reqId: number, d: 'allow' | 'deny' | 'always'): Promise<void> {
-    if (P.kind === 'desktop') {
-      this.hub.decide(reqId, d);
+    if (this.agentsLocal) {
+      if (!this.agentHub.decide(reqId, d)) return this.say('Этот запрос уже неактуален — его забрал терминал.', 'think', 3000);
     } else {
-      if (d !== 'deny' && !(await P.biometric('Разрешить действие Claude Code'))) return;
+      if (d !== 'deny' && !(await P.biometric('Разрешить действие агента'))) return;
       try {
         await this.link.sendDecision(reqId, d);
         if (this.remote) this.remote.pending = this.remote.pending.filter((p) => p.reqId !== reqId);
@@ -782,6 +950,63 @@ class App {
       }
     }
     this.sfx(d === 'deny' ? 'poke' : 'done');
+    this.renderAgents();
+  }
+
+  /** Выбрать вариант в вопросе агента. Один вариант — отвечаем сразу, несколько — по кнопке «Ответить». */
+  async pickOption(reqId: number, qi: number, label: string): Promise<void> {
+    const p = this.agentPending().find((x) => x.reqId === reqId);
+    const q = p?.questions?.[qi];
+    if (!p || !q) return;
+    const sel = this.qSel.get(reqId) ?? {};
+    const cur = new Set(sel[q.question] ?? []);
+    if (q.multiSelect) cur.has(label) ? cur.delete(label) : cur.add(label);
+    else {
+      cur.clear();
+      cur.add(label);
+    }
+    sel[q.question] = [...cur];
+    this.qSel.set(reqId, sel);
+    const complete = p.questions!.every((x) => (sel[x.question] ?? []).length > 0);
+    if (complete && !p.questions!.some((x) => x.multiSelect)) return this.answerAgent(reqId);
+    this.lastHtml = '';
+    this.render();
+  }
+
+  async answerAgent(reqId: number): Promise<void> {
+    const p = this.agentPending().find((x) => x.reqId === reqId);
+    const sel = this.qSel.get(reqId) ?? {};
+    if (!p?.questions) return;
+    if (p.questions.some((q) => !(sel[q.question] ?? []).length)) return this.say('Выберите ответ на каждый вопрос.', 'think', 3000);
+    const answers: Record<string, string | string[]> = {};
+    for (const q of p.questions) answers[q.question] = q.multiSelect ? sel[q.question] : sel[q.question][0];
+    let ok = false;
+    try {
+      if (this.agentsLocal) ok = this.agentHub.answer(reqId, answers);
+      else {
+        ok = await this.link.sendAnswer(reqId, answers);
+        if (ok && this.remote) this.remote.pending = this.remote.pending.filter((x) => x.reqId !== reqId);
+      }
+    } catch (e) {
+      return this.say('ПК не ответил: ' + String((e as Error).message ?? e), 'think', 4000);
+    }
+    this.qSel.delete(reqId);
+    if (!ok) return this.say('Ответ не подошёл или вопрос уже закрыт — ответьте в терминале.', 'think', 4000);
+    this.sfx('done');
+    this.say(`Ответил ${p.agent ?? 'Claude'}: ${Object.values(answers).flat().join(', ')}`, 'happy', 3000);
+    this.renderAgents();
+  }
+
+  async closeSession(id: string): Promise<void> {
+    if (this.agentsLocal) this.agentHub.close(id);
+    else {
+      try {
+        await this.link.sendClose(id);
+        if (this.remote) this.remote.sessions = this.remote.sessions.filter((s) => s.id !== id);
+      } catch (e) {
+        return this.say('ПК не ответил: ' + String((e as Error).message ?? e), 'think', 4000);
+      }
+    }
     this.renderAgents();
   }
 
@@ -833,30 +1058,250 @@ class App {
     this.renderAgents();
   }
 
+  /** Карточка одного запроса: разрешение или вопрос с вариантами. */
+  pendingHtml(p: Pending, pos: number, total: number): string {
+    const head = `<div class="who"><i class="dotc" style="background:${esc(p.color ?? '#f4c470')}"></i><b>${esc(p.agent ?? 'Claude Code')}</b> · ${esc(p.project)} · ${ago(p.created)}${total > 1 ? ` <span class="muted">· ${pos + 1} из ${total}</span>` : ''}</div>`;
+    if (p.questions) {
+      const sel = this.qSel.get(p.reqId) ?? {};
+      const qs = p.questions
+        .map((q, qi) => {
+          const opts = q.options
+            .map((o) => {
+              const on = (sel[q.question] ?? []).includes(o.label);
+              return `<button class="opt ${on ? 'on' : ''}" data-act="agent-pick" data-id="${p.reqId}" data-q="${qi}" data-label="${esc(o.label)}" title="${esc(o.description ?? '')}"><b>${q.multiSelect ? (on ? '☑ ' : '☐ ') : ''}${esc(o.label)}</b>${o.description ? `<span>${esc(o.description)}</span>` : ''}</button>`;
+            })
+            .join('');
+          return `<div class="q">${q.header ? `<span class="muted small">${esc(q.header)}</span> ` : ''}<div class="t">${esc(q.question)}</div><div class="opts">${opts}</div>${q.multiSelect ? '<span class="muted small">Можно выбрать несколько.</span>' : ''}</div>`;
+        })
+        .join('');
+      const needBtn = p.questions.length > 1 || p.questions.some((q) => q.multiSelect);
+      return `<li class="item perm ask" style="--sc:${esc(p.color ?? '#7cc4ff')}"><div class="body">${head}${qs}
+        <div class="row">${needBtn ? `<button class="pill small" data-act="agent-answer" data-id="${p.reqId}">Ответить</button>` : ''}<button class="pill ghost small" data-act="agent-deny" data-id="${p.reqId}">Отвечу в терминале</button></div></div></li>`;
+    }
+    return `<li class="item perm" style="--sc:${esc(p.color ?? '#f4c470')}"><div class="body">${head}<div class="t"><b>${esc(p.tool)}</b> · <code>${esc(p.summary)}</code></div>
+      <div class="row"><button class="pill small" data-act="agent-allow" data-id="${p.reqId}">Разрешить</button><button class="pill ghost small" data-act="agent-always" data-id="${p.reqId}">Всегда в «${esc(p.project)}»</button><button class="pill ghost small" data-act="agent-deny" data-id="${p.reqId}">Запретить</button></div></div></li>`;
+  }
+
   agentsHtml(): string {
     const pend = this.agentPending();
     const sess = this.agentSessions();
-    const STATUS: Record<Session['status'], string> = { working: 'работает', waiting: 'ждёт вас', done: 'закончил', ended: 'сессия закрыта' };
+    const now = Date.now();
     let h = '';
+    if (this.demo) h += `<div class="card demo-banner"><b>Демо-режим</b> <span class="muted">— две выдуманные сессии, разрешение и вопрос. Ничего не записывается и никуда не отправляется.</span><div class="row"><button class="pill ghost small" data-act="demo-stop">Выйти из демо</button></div></div>`;
     if (pend.length) {
-      h += '<h3 class="warn">Просит разрешения</h3><ul>';
-      for (const p of pend)
-        h += `<li class="item perm"><div class="body"><div class="t"><b>${esc(p.tool)}</b> · ${esc(p.summary)}</div><div class="m">${esc(p.project)} · ${ago(p.created)}</div>
-          <div class="row"><button class="pill small" data-act="agent-allow" data-id="${p.reqId}">Разрешить</button><button class="pill ghost small" data-act="agent-always" data-id="${p.reqId}">Всегда в этом проекте</button><button class="pill ghost small" data-act="agent-deny" data-id="${p.reqId}">Запретить</button></div></div></li>`;
-      h += '</ul>';
+      h += `<h3 class="warn">Ждут вашего ответа · ${pend.length}</h3><ul>${pend.map((p, i) => this.pendingHtml(p, i, pend.length)).join('')}</ul>`;
+      if (pend.length > 1) h += '<p class="muted small">Каждый запрос привязан к своей сессии — отвечайте в любом порядке. Без ответа за 2 минуты вопрос вернётся в терминал.</p>';
     }
-    if (!sess.length && !pend.length)
-      h += `<p class="muted">${P.kind === 'desktop' ? 'Запустите Claude Code — здесь появятся его шаги, правки и запросы разрешений.' : 'Когда на ПК работает Claude Code, здесь видно, что он делает, и можно разрешать его действия.'}</p>`;
-    for (const s of sess) {
-      h += `<h3>${esc(s.project)} <span class="pill-status st-${s.status}">${STATUS[s.status]}</span></h3>`;
-      if (s.prompt) h += `<p class="muted small">«${esc(s.prompt)}»</p>`;
-      const steps = s.steps.slice(-10).reverse();
-      if (steps.length)
-        h += `<ul class="steps">${steps
-          .map((st) => `<li><span class="k k-${st.kind}">${KIND_LABEL[st.kind]}</span> <span class="tx">${esc(st.text)}</span>${st.plus != null ? ` <span class="plus">+${st.plus}</span> <span class="minus">−${st.minus}</span>` : ''}</li>`)
-          .join('')}</ul>`;
+    if (sess.length) {
+      // пилюли сессий — коротко, все сразу
+      h += `<h3>Сессии · ${sess.length}</h3><div class="spills">${sess
+        .map((s) => {
+          const last = s.steps[s.steps.length - 1];
+          const step = s.status === 'working' && last ? `${KIND_LABEL[last.kind]} ${last.text}` : STATUS_LABEL[s.status];
+          return `<a class="spill st-${s.status}" href="#s-${esc(s.id)}" style="--sc:${esc(s.color ?? '#f4c470')}"><i></i><b>${esc(s.project)}</b><span>${esc(step)}</span>${s.plus || s.minus ? `<em><span class="plus">+${s.plus}</span> <span class="minus">−${s.minus}</span></em>` : ''}</a>`;
+        })
+        .join('')}</div>`;
+      for (const s of sess) {
+        h += `<div class="session" id="s-${esc(s.id)}" style="--sc:${esc(s.color ?? '#f4c470')}"><h3><i class="dotc"></i>${esc(s.project)} <span class="pill-status st-${s.status}">${STATUS_LABEL[s.status]}</span>
+          <span class="muted small">${esc(s.agent)}${s.started ? ` · ${duration(now - s.started)}` : ''}${s.plus || s.minus ? ` · <span class="plus">+${s.plus}</span> <span class="minus">−${s.minus}</span>` : ''}</span>
+          <button class="x" data-act="agent-close" data-id="${esc(s.id)}" title="Закрыть сессию: убрать пилюлю, её вопросы уйдут в терминал" aria-label="Закрыть сессию">×</button></h3>`;
+        if (s.prompt) h += `<p class="muted small">«${esc(s.prompt)}»</p>`;
+        const steps = s.steps.slice(-10).reverse();
+        if (steps.length)
+          h += `<ul class="steps">${steps
+            .map((st) => `<li><span class="k k-${st.kind}">${KIND_LABEL[st.kind]}</span> <span class="tx">${esc(st.text)}</span>${st.plus != null ? ` <span class="plus">+${st.plus}</span> <span class="minus">−${st.minus}</span>` : ''}</li>`)
+            .join('')}</ul>`;
+        if (s.final) h += `<p class="small final">💬 ${esc(s.final)}</p>`;
+        h += '</div>';
+      }
+      if (sess.some((s) => ['done', 'ended', 'stale', 'error'].includes(s.status))) h += '<div class="row"><button class="pill ghost small" data-act="agents-clear">Убрать закончившие</button></div>';
     }
+    if (!sess.length && !pend.length) {
+      if (P.kind === 'desktop' && !this.claudeHooks)
+        h += `<div class="card"><p><b>Тук может следить за Claude Code</b> — показывать шаги каждой сессии своим цветом, правки +N/−M, просить разрешения и отвечать на вопросы прямо отсюда (и с телефона).</p>
+          <div class="row"><button class="pill small" data-act="claude-on">Подключить Claude Code</button><button class="pill ghost small" data-act="demo-start">Посмотреть демо</button></div>
+          <p class="muted small">Тук добавит свои хуки в ~/.claude/settings.json, сохранив ваши настройки. Отключить — ⚙ → «Агенты».</p></div>`;
+      else
+        h += `<p class="muted">${P.kind === 'desktop' ? 'Запустите Claude Code — здесь появятся его сессии, шаги, правки и запросы разрешений. Несколько сессий сразу — каждая своим цветом.' : this.link.linked ? 'Когда на ПК работает Claude Code, здесь видно каждую сессию, и можно разрешать действия и отвечать на вопросы.' : 'Свяжите телефон с ПК (⚙ → «Связь»), чтобы видеть здесь сессии Claude Code и отвечать на запросы.'}</p>
+          <div class="row"><button class="pill ghost small" data-act="demo-start">Посмотреть демо</button></div>`;
+    }
+    if (P.kind === 'desktop' && !this.demo) h += `<label class="toggle"><input type="checkbox" id="set-agentclean" ${this.store.data.settings.agentAutoClean !== false ? 'checked' : ''}> Убирать закончившие сессии через 30 мин и молчащие — через час</label>`;
     return h;
+  }
+
+  // ---------------- Демо-режим ----------------
+  // По мотивам Coucou (MIT, Louis Raillé): сценарий показывает все состояния без настройки и
+  // ничего не пишет на диск — отдельный хаб, файл в памяти, настроения по очереди.
+
+  startDemo(): void {
+    this.stopDemo(true);
+    const hub = new AgentHub(() => {}, () => [], () => {});
+    hub.onChange = () => this.renderAgents();
+    hub.onEvent = (e) => this.onAgentEvent(e);
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    this.demo = { hub, timers };
+    demoScript().forEach((e, i) => timers.push(setTimeout(() => hub.handle(9000 + i, JSON.stringify(e.body)), e.at)));
+    // все настроения персонажа по очереди
+    const moods = Object.keys(MOOD_LABEL) as Mood[];
+    moods.forEach((m, i) =>
+      timers.push(
+        setTimeout(() => {
+          this.flash(m, 1500);
+          this.reply = `Демо: ${MOOD_LABEL[m]} (${i + 1} из ${moods.length})`;
+          this.replyUntil = Date.now() + 1500;
+          this.renderReply();
+          this.renderBar();
+        }, 5200 + i * 1600),
+      ),
+    );
+    // файл-пример: карточка, обрезка и действия — только в памяти
+    if (!this.files.length) {
+      const text = '# План работ\n- [ ] Купить кабель ВВГ 3×2,5\n- [ ] Заказать вентилятор EKF\n- [ ] Проверить щит 600×800\n\n' + 'Пояснение к расчёту. '.repeat(400);
+      void this.takeFiles([new File([text], 'Демо — план работ.md')]).then(() => this.demo && this.setTab('agents'));
+    }
+    this.applyMode('expanded');
+    this.setTab('agents');
+    this.say('Демо: две сессии Claude Code, разрешение, вопрос, файл и все мои настроения. Ничего не сохраняется.', 'wave', 5000);
+  }
+
+  stopDemo(silent = false): void {
+    if (!this.demo) return;
+    for (const t of this.demo.timers) clearTimeout(t);
+    this.demo = null;
+    this.files = this.files.filter((c) => !c.name.startsWith('Демо — '));
+    this.renderFileChip();
+    this.renderAgents();
+    if (!silent) this.say('Демо закончилось — всё вернул как было.', 'idle', 3000);
+  }
+
+  // ---------------- Первый запуск ----------------
+
+  /** Три шага: питомец/остров, горячая клавиша/голос, мозг. Можно открыть снова из ⚙ → «Справка и демо». */
+  renderOnboarding(): void {
+    const ov = $('#overlay');
+    const st = this.store.data.settings;
+    const step = Math.min(this.onboardStep, 2);
+    const desk = P.kind === 'desktop';
+    const dots = [0, 1, 2].map((i) => `<i class="${i === step ? 'on' : ''}"></i>`).join('');
+    let body = '';
+    if (step === 0) {
+      body = desk
+        ? `<h2>Привет! Я ${esc(st.name)}.</h2><p>Я живу у верхнего края экрана: наведите мышь — выгляну, щёлкните — раскроюсь. А ещё могу жить прямо на рабочем столе.</p>
+          <div class="row"><button class="pill ${this.petOpen ? 'ghost' : ''}" data-act="${this.petOpen ? 'pet-off' : 'pet-on'}">${this.petOpen ? 'Вернуть в строку' : 'Выпустить на рабочий стол'}</button></div>
+          <p class="muted small">Перетаскивайте меня мышью; двойной щелчок — обратно в строку. Это же — в меню значка в трее.</p>`
+        : P.kind === 'android'
+          ? `<h2>Привет! Я ${esc(st.name)}.</h2><p>Могу жить вверху экрана поверх любых приложений — нажали на меня, и открылось маленькое окно с делами и голосом.</p>
+            <div class="row"><button class="pill" data-act="island-on">Включить Тука над приложениями</button></div><p class="muted small">Android попросит разрешение «Поверх других приложений».</p>`
+          : `<h2>Привет! Я ${esc(st.name)}.</h2><p>Это демо в браузере. В приложении я живу у верхнего края экрана Windows и над приложениями на телефоне.</p>`;
+    } else if (step === 1) {
+      body = desk
+        ? `<h2>Позвать меня</h2><p><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Пробел</kbd> — открыть или свернуть из любой программы, ввод сразу в фокусе. <kbd>Esc</kbd> — свернуть.</p>
+          <p>Внутри: <kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>8</kbd> — вкладки, <kbd>Ctrl</kbd>+<kbd>O</kbd> — прикрепить файлы.</p>
+          <label class="toggle"><input type="checkbox" id="set-autostart" ${st.autostart ? 'checked' : ''}> Запускать вместе с Windows</label>`
+        : `<h2>Позвать меня</h2><p>Нажмите 🎤 и говорите${P.kind === 'android' ? ' — или включите «Тук Тук», чтобы звать голосом с любого экрана' : ''}.</p>
+          ${P.kind === 'android' ? '<div class="row"><button class="pill ghost" data-act="wake-on">Включить «Тук Тук»</button></div>' : ''}`;
+      body += '<p class="muted small">Пишите как человеку: «напомни завтра в 9 позвонить», «запиши купить кабель», «давление 125 на 80».</p>';
+    } else {
+      const b = this.brain.state;
+      body = `<h2>Мозг</h2><p>Чтобы разговаривать и обсуждать файлы, мне нужна нейросеть. Она работает без интернета, прямо на устройстве.</p>
+        ${b.s === 'ready' ? '<p><b>Мозг уже загружен ✓</b></p>' : `<div class="row"><button class="pill" data-act="brain-download">Скачать мозг «${esc(this.brain.model.name)}» · ${(this.brain.model.bytes / 1e9).toFixed(1).replace('.', ',')} ГБ</button></div>`}
+        ${desk ? '<p class="muted small">Уже есть Ollama или LM Studio? Подключите их в ⚙ → «Мозг» — скачивать ничего не придётся.</p>' : ''}
+        <p class="muted small">Записи, напоминания, файлы-заметки и Claude Code работают и без мозга.</p>`;
+    }
+    ov.innerHTML = `<div class="sheet onboard"><div class="steps-dots">${dots}</div>${body}
+      <div class="row nav">${step > 0 ? '<button class="pill ghost" data-act="onboard-back">Назад</button>' : '<button class="pill ghost" data-act="onboard-skip">Пропустить</button>'}
+      ${step < 2 ? '<button class="pill" data-act="onboard-next">Дальше</button>' : '<button class="pill" data-act="onboard-done">Готово</button>'}
+      <button class="pill ghost small" data-act="demo-start" title="Посмотреть все состояния без настройки">Демо</button></div></div>`;
+    ov.hidden = false;
+    if (P.kind === 'desktop' && this.mode !== 'expanded') this.applyMode('expanded');
+  }
+
+  finishOnboarding(): void {
+    $('#overlay').hidden = true;
+    if (!this.store.data.settings.onboarded) {
+      this.store.data.settings.onboarded = true;
+      this.store.changed('settings');
+    }
+    this.say('Если что — всё это есть в ⚙. Напишите «помощь», чтобы увидеть, что я умею.', 'happy', 5000);
+  }
+
+  // ---------------- Локальный сервер (Ollama / LM Studio) ----------------
+
+  async checkLocal(): Promise<void> {
+    const l = (this.store.data.settings.localAi ??= { on: false, url: LOCAL_PRESETS[0].url, model: '' });
+    const input = document.querySelector<HTMLInputElement>('#set-local-url');
+    if (input) l.url = input.value.trim();
+    try {
+      this.localModels = await listModels(l.url);
+      if (!this.localModels.length) this.say('Сервер отвечает, но моделей нет. В Ollama: «ollama pull qwen3:4b».', 'think', 6000);
+      else {
+        if (!l.model || !this.localModels.includes(l.model)) l.model = this.localModels[0];
+        this.say(`Нашёл моделей: ${this.localModels.length}. Выберите, какой думать.`, 'happy', 4000);
+      }
+    } catch (e) {
+      this.localModels = [];
+      this.say(String((e as Error).message ?? e), 'think', 8000);
+    }
+    this.store.changed('settings');
+    this.lastHtml = '';
+    this.render();
+  }
+
+  localHtml(): string {
+    const l = this.store.data.settings.localAi ?? { on: false, url: LOCAL_PRESETS[0].url, model: '' };
+    return `<h3>Ollama / LM Studio</h3><div class="card">
+      <span class="muted">Если на этом ПК (или дома в сети) уже запущен сервер нейросети, Тук может думать им — быстрее и умнее встроенного мозга. Только локальные адреса: облака Тук не использует.</span>
+      <div class="row">${LOCAL_PRESETS.map((x) => `<button class="pill ghost small ${l.url === x.url ? 'on' : ''}" data-act="local-preset" data-id="${x.url}">${x.name}</button>`).join('')}</div>
+      <div class="row"><input id="set-local-url" value="${esc(l.url)}" placeholder="http://127.0.0.1:11434"><button class="pill small" data-act="local-check">Проверить</button></div>
+      ${this.localModels.length ? `<div class="row">${this.localModels.map((m) => `<button class="pill small ${m === l.model ? '' : 'ghost'}" data-act="local-model" data-id="${esc(m)}">${esc(m)}</button>`).join('')}</div>` : l.model ? `<p class="muted small">Модель: <b>${esc(l.model)}</b></p>` : ''}
+      <label class="toggle"><input type="checkbox" id="set-local-on" ${l.on ? 'checked' : ''} ${l.model ? '' : 'disabled'}> Думать этим сервером${this.brain.ready ? ' (встроенный мозг — запасной)' : ''}</label></div>`;
+  }
+
+  // ---------------- Горячие клавиши ----------------
+
+  showShortcuts(): void {
+    const ov = $('#overlay');
+    const rows: [string, string][] = [
+      ...(P.kind === 'desktop' ? ([['Ctrl+Alt+Пробел', 'открыть / свернуть Тука из любой программы'], ['Esc', 'свернуть']] as [string, string][]) : []),
+      ['Alt+1 … Alt+8', 'вкладки: Сегодня, Чат, Дела, Напоминания, Здоровье, Заметки, Агенты, ⚙'],
+      ['Ctrl+O', 'прикрепить файлы'],
+      ['Ctrl+Enter', 'разрешить первый запрос агента'],
+      ['Ctrl+Backspace', 'запретить первый запрос агента'],
+      ['/ или Ctrl+K', 'перейти в строку ввода'],
+      ['?', 'эта подсказка'],
+    ];
+    ov.innerHTML = `<div class="sheet onboard"><h2>Горячие клавиши</h2><table class="keys">${rows.map(([k, v]) => `<tr><td><kbd>${esc(k)}</kbd></td><td>${esc(v)}</td></tr>`).join('')}</table><div class="row"><button class="pill" data-act="overlay-close">Понятно</button></div></div>`;
+    ov.hidden = false;
+  }
+
+  onKey(e: KeyboardEvent): void {
+    const typing = (e.target as HTMLElement)?.matches?.('input, textarea');
+    if (e.altKey && !e.ctrlKey && /^Digit[1-8]$/.test(e.code)) {
+      e.preventDefault();
+      this.setTab(TAB_ORDER[+e.code.slice(5) - 1]);
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.code === 'KeyO') {
+      e.preventDefault();
+      $<HTMLInputElement>('#file-input').click();
+      return;
+    }
+    const first = this.agentPending()[0];
+    if ((e.ctrlKey || e.metaKey) && first && !first.questions && (e.key === 'Enter' || e.key === 'Backspace') && !(typing && e.key === 'Backspace')) {
+      e.preventDefault();
+      void this.decideAgent(first.reqId, e.key === 'Enter' ? 'allow' : 'deny');
+      return;
+    }
+    if ((e.ctrlKey && e.code === 'KeyK') || (!typing && e.key === '/')) {
+      e.preventDefault();
+      $<HTMLInputElement>('#input').focus();
+      return;
+    }
+    if (!typing && e.key === '?') this.showShortcuts();
+    if (e.key === 'Escape' && !$('#overlay').hidden) {
+      $('#overlay').hidden = true;
+      if (!this.store.data.settings.onboarded) this.finishOnboarding();
+    }
   }
 
   // ---------------- Музыка ----------------
@@ -1583,8 +2028,8 @@ class App {
     const fileInput = $<HTMLInputElement>('#file-input');
     $('#attach').addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', () => {
-      const f = fileInput.files?.[0];
-      if (f) void this.takeFile(f);
+      const list = [...(fileInput.files ?? [])];
+      if (list.length) void this.takeFiles(list);
       fileInput.value = '';
     });
     document.addEventListener('dragover', (e) => {
@@ -1594,8 +2039,8 @@ class App {
     });
     document.addEventListener('drop', (e) => {
       e.preventDefault();
-      const f = e.dataTransfer?.files?.[0];
-      if (f) void this.takeFile(f);
+      const list = [...(e.dataTransfer?.files ?? [])];
+      if (list.length) void this.takeFiles(list);
     });
 
     $('#bar').addEventListener('click', (e) => {
@@ -1631,6 +2076,8 @@ class App {
       });
     }
 
+    document.addEventListener('keydown', (e) => this.onKey(e));
+
     $('#tabs').addEventListener('click', (e) => {
       const b = (e.target as HTMLElement).closest('[data-tab]') as HTMLElement | null;
       if (b) this.setTab(b.dataset.tab as Tab);
@@ -1651,6 +2098,18 @@ class App {
       else if (t.id === 'set-usepc') st.usePcBrain = t.checked;
       else if (t.id === 'set-dance') st.dance = t.checked;
       else if (t.id === 'set-voiceloop') st.voiceLoop = t.checked;
+      else if (t.id === 'set-agentclean') st.agentAutoClean = t.checked;
+      else if (t.id === 'set-local-on' || t.id === 'set-local-url' || t.id === 'set-local-model') {
+        const l = (st.localAi ??= { on: false, url: LOCAL_PRESETS[0].url, model: '' });
+        if (t.id === 'set-local-on') l.on = t.checked;
+        else if (t.id === 'set-local-url') l.url = t.value.trim();
+        else l.model = t.value.trim();
+        if (l.on && !isLocalUrl(l.url)) {
+          l.on = false;
+          this.say('Нужен локальный адрес: localhost или компьютер в вашей сети. Облачные сервисы Тук не использует.', 'think', 6000);
+        }
+        this.lastHtml = '';
+      }
       else if (t.id === 'set-volume') {
         st.volume = +t.value / 100;
         this.applyLook();
@@ -1788,6 +2247,76 @@ class App {
       case 'agent-always':
         await this.decideAgent(+id, act === 'agent-allow' ? 'allow' : act === 'agent-deny' ? 'deny' : 'always');
         break;
+      case 'agent-pick':
+        await this.pickOption(+id, +(el.dataset.q ?? 0), el.dataset.label ?? '');
+        break;
+      case 'agent-answer':
+        await this.answerAgent(+id);
+        break;
+      case 'agent-close':
+        await this.closeSession(id);
+        break;
+      case 'agents-clear':
+        if (this.agentsLocal) this.agentHub.clearFinished();
+        else if (this.remote) for (const x of this.remote.sessions.filter((x) => ['done', 'ended', 'stale', 'error'].includes(x.status))) await this.closeSession(x.id);
+        this.renderAgents();
+        break;
+      case 'demo-start':
+        this.startDemo();
+        break;
+      case 'demo-stop':
+        this.stopDemo();
+        break;
+      case 'set-sec':
+        this.setSec = id as SetSec;
+        this.lastHtml = '';
+        this.render();
+        $('#view').scrollTop = 0;
+        break;
+      case 'onboard-next':
+        this.onboardStep++;
+        this.renderOnboarding();
+        break;
+      case 'onboard-back':
+        this.onboardStep = Math.max(0, this.onboardStep - 1);
+        this.renderOnboarding();
+        break;
+      case 'onboard-skip':
+      case 'onboard-done':
+        this.finishOnboarding();
+        break;
+      case 'onboard-open':
+        this.onboardStep = 0;
+        this.renderOnboarding();
+        break;
+      case 'local-preset':
+        (this.store.data.settings.localAi ??= { on: false, url: '', model: '' }).url = id;
+        this.store.changed('settings');
+        this.lastHtml = '';
+        this.render();
+        break;
+      case 'local-check':
+        await this.checkLocal();
+        break;
+      case 'local-model': {
+        const l = (this.store.data.settings.localAi ??= { on: true, url: LOCAL_PRESETS[0].url, model: '' });
+        l.model = id;
+        l.on = true;
+        this.store.changed('settings');
+        this.say(`Буду думать моделью ${id}.`, 'happy', 3000);
+        this.lastHtml = '';
+        this.render();
+        break;
+      }
+      case 'shortcuts':
+        this.showShortcuts();
+        break;
+      case 'rule-del':
+        (this.store.data.agentRules ?? []).splice(+id, 1);
+        this.store.changed('rules');
+        this.lastHtml = '';
+        this.render();
+        break;
       case 'media-toggle':
       case 'media-next':
       case 'media-prev':
@@ -1829,8 +2358,14 @@ class App {
         await this.setClaudeHooks(false);
         break;
       case 'file-drop':
-        this.file = null;
-        this.renderFileChip();
+        this.dropFile(id);
+        break;
+      case 'file-ask':
+      case 'file-note':
+      case 'file-tasks':
+      case 'file-open':
+      case 'file-folder':
+        await this.fileAction(act, id);
         break;
       case 'set-outfit':
         this.store.data.settings.outfit = id as Outfit | 'auto';
@@ -1961,8 +2496,15 @@ class App {
     const pend = this.agentPending();
     if (pend.length) {
       const p = pend[0];
-      line = `<b>Claude: ${esc(p.tool)}</b> ${esc(p.summary)}`;
-      actions = `<button class="mini ok" data-act="agent-allow" data-id="${p.reqId}" title="Разрешить">✓</button><button class="mini" data-act="agent-deny" data-id="${p.reqId}" title="Запретить">✕</button>`;
+      const more = pend.length > 1 ? ` <span class="muted">+${pend.length - 1}</span>` : '';
+      const dot = `<i class="dotc" style="background:${esc(p.color ?? '#f4c470')}"></i>`;
+      if (p.questions) {
+        line = `${dot}<b>${esc(p.project)}:</b> ${esc(p.questions[0].question)}${more}`;
+        actions = `<button class="mini ok" data-act="tab" data-id="agents" title="Выбрать ответ">Ответить</button>`;
+      } else {
+        line = `${dot}<b>${esc(p.project)} · ${esc(p.tool)}</b> ${esc(p.summary)}${more}`;
+        actions = `<button class="mini ok" data-act="agent-allow" data-id="${p.reqId}" title="Разрешить">✓</button><button class="mini" data-act="agent-deny" data-id="${p.reqId}" title="Запретить">✕</button>`;
+      }
     } else if (ring.length) {
       const it = ring[0];
       line = `<b>${esc(it.text)}</b>`;
@@ -2127,42 +2669,39 @@ class App {
   }
 
   settingsHtml(): string {
+    const nav = `<nav class="setnav">${SET_SECTIONS.map(([id, name]) => `<button class="${this.setSec === id ? 'on' : ''}" data-act="set-sec" data-id="${id}">${name}</button>`).join('')}</nav>`;
+    let body = '';
+    switch (this.setSec) {
+      case 'main': body = this.setMainHtml(); break;
+      case 'look': body = this.setLookHtml(); break;
+      case 'brain': body = `<h3>Встроенный мозг</h3>${this.brainHtml(true)}${P.kind !== 'android' ? this.localHtml() : ''}`; break;
+      case 'link': body = this.setLinkHtml(); break;
+      case 'agents': body = this.setAgentsHtml(); break;
+      case 'device': body = this.setDeviceHtml(); break;
+      case 'help': body = this.setHelpHtml(); break;
+    }
+    return nav + body + '<p class="muted small">Тук · версия 0.2 · всё хранится только на ваших устройствах</p>';
+  }
+
+  setMainHtml(): string {
     const d = this.store.data;
     const st = d.settings;
-    let link = '';
-    if (P.kind === 'android') {
-      if (this.link.linked) {
-        link = `<div class="card"><div><b>Связан с ${esc(d.sync.pcName ?? 'ПК')}</b></div>
-          <div class="muted">${esc(d.sync.host ?? '')} · последняя синхронизация: ${d.sync.lastSync ? ago(d.sync.lastSync) : 'ещё не было'}</div>
-          ${d.sync.lastError && this.link.status.state === 'error' ? `<div class="err">${esc(d.sync.lastError)}</div>` : ''}
-          <div class="row"><button class="pill" data-act="sync">Синхронизировать</button><button class="pill ghost" data-act="unlink">Отвязать</button></div></div>`;
-      } else {
-        link = `<div class="card"><p>Откройте Тук на ПК → вкладка ⚙ — там QR-код. ПК и телефон должны быть в одной сети Wi-Fi.</p>
-          <button class="pill big" data-act="scan">Сканировать QR-код с ПК</button>
-          <p class="muted">Или по коду из 6 цифр:</p>
-          <button class="pill ghost" data-act="discover">Найти ПК в сети</button>
-          ${this.found.map((f) => `<button class="found" data-act="pick" data-id="${f.id}">${esc(f.name)} · ${f.ip}</button>`).join('')}
-          <div class="row"><input id="pair-ip" inputmode="decimal" placeholder="IP ПК, например 192.168.1.5" value="${esc(this.found[0]?.ip ?? '')}"><input id="pair-pin" inputmode="numeric" maxlength="7" placeholder="Код"></div>
-          <button class="pill" data-act="pair-pin">Связать</button></div>`;
-      }
-    } else {
-      const peers = d.sync.peers ?? [];
-      link = `<div class="card qr-card"><div id="qr" class="qr"></div>
-        <div><p>На телефоне: Тук → ⚙ → <b>«Сканировать QR-код с ПК»</b>.</p><p class="muted" id="qr-ip"></p>
-        <p class="muted">Нет камеры? Нажмите «Код из 6 цифр» и введите его на телефоне.</p>
-        <button class="pill ghost" data-act="pin">Код из 6 цифр</button><div id="pin-box"></div></div></div>
-        ${peers.length ? `<h4>Связанные устройства</h4><ul>${peers.map((p) => `<li class="item"><span class="dot"></span><div class="body"><div class="t">${esc(p.name)}</div><div class="m">был на связи ${ago(p.lastSeen)}</div></div></li>`).join('')}</ul><button class="pill ghost" data-act="reset-key">Отвязать все устройства</button>` : ''}
-        ${P.kind === 'web' ? '<p class="muted">В демо-режиме QR-код показан для примера — связь работает только в приложении.</p>' : ''}`;
-    }
-    const moods = (Object.keys(MOOD_LABEL) as Mood[]).map((m) => `<button class="pill ghost small" data-act="preview" data-mood="${m}">${MOOD_LABEL[m]}</button>`).join('');
-    return `<h3>Связь ${P.kind === 'android' ? 'с ПК' : 'с телефоном'}</h3>${link}
-      <h3>Мозг</h3>${this.brainHtml(true)}
-      <h3>Помощник</h3>
+    return `<h3>Помощник</h3>
       <label class="field"><span>Имя помощника</span><input id="set-name" value="${esc(st.name)}"></label>
       <label class="field"><span>Имя этого устройства</span><input id="set-device" value="${esc(d.deviceName)}"></label>
       <label class="toggle"><input type="checkbox" id="set-sound" ${st.sound ? 'checked' : ''}> Звуки</label>
       <label class="field"><span>Громкость</span><input type="range" id="set-volume" min="0" max="100" value="${Math.round((st.volume ?? 0.5) * 100)}"></label>
-      <h3>Гардероб</h3>
+      ${P.kind === 'desktop' ? `<label class="toggle"><input type="checkbox" id="set-autostart" ${st.autostart ? 'checked' : ''}> Запускать вместе с Windows</label>
+      <p class="muted small">Открыть строку: <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Пробел</kbd>. Свернуть: <kbd>Esc</kbd>. <button class="linkbtn" data-act="shortcuts">Все горячие клавиши</button></p>` : ''}
+      <h3>Сводка</h3>
+      <button class="pill ghost" data-act="recap">Сводка за неделю</button>
+      <p class="muted small">Каждый понедельник она появляется на «Сегодня» сама; здесь — в любой день.</p>
+      ${P.kind === 'desktop' ? '<h3>Выход</h3><button class="pill ghost" data-act="quit">Выйти из Тука</button>' : ''}`;
+  }
+
+  setLookHtml(): string {
+    const st = this.store.data.settings;
+    return `<h3>Гардероб</h3>
       <div class="wardrobe">${(['auto', ...Object.keys(OUTFIT_LABEL)] as (Outfit | 'auto')[]).map((o) => `<button class="look ${(st.outfit ?? 'auto') === o ? 'on' : ''}" data-act="set-outfit" data-id="${o}"><canvas data-outfit="${o === 'auto' ? seasonalOutfit() : o}"></canvas><span>${o === 'auto' ? 'По сезону' : esc(OUTFIT_LABEL[o])}</span></button>`).join('')}</div>
       <p class="muted small">Цвет капюшона</p>
       <div class="swatches">${Object.entries(HOOD_COLORS).map(([n, c]) => `<button class="sw ${st.hoodColor === n ? 'on' : ''}" data-act="set-hood" data-id="${esc(n)}" title="${esc(n)}" style="background:rgb(${c.join(',')})"></button>`).join('')}</div>
@@ -2170,15 +2709,62 @@ class App {
       <div class="swatches"><button class="sw auto ${!st.lightColor ? 'on' : ''}" data-act="set-light" data-id="" title="Как задумано">✦</button>${Object.entries(LIGHT_COLORS).map(([n, c]) => `<button class="sw ${st.lightColor === n ? 'on' : ''}" data-act="set-light" data-id="${esc(n)}" title="${esc(n)}" style="background:rgb(${c.join(',')})"></button>`).join('')}</div>
       ${P.kind === 'desktop' ? `<h3>На рабочем столе</h3>
       <div class="row"><button class="pill ${this.petOpen ? 'ghost' : ''}" data-act="${this.petOpen ? 'pet-off' : 'pet-on'}">${this.petOpen ? 'Вернуть Тука в строку' : 'Выпустить Тука на рабочий стол'}</button></div>
-      <p class="muted small">Его можно перетаскивать; клик — тычок, двойной клик — обратно в строку. То же — в меню значка в трее.</p>
-      <h3>Музыка</h3>
+      <p class="muted small">Его можно перетаскивать; клик — тычок, двойной клик — обратно в строку. То же — в меню значка в трее.</p>` : ''}
+      <h3>Состояния персонажа</h3><div class="moods-demo">${(Object.keys(MOOD_LABEL) as Mood[]).map((m) => `<button class="pill ghost small" data-act="preview" data-mood="${m}">${MOOD_LABEL[m]}</button>`).join('')}</div>`;
+  }
+
+  setLinkHtml(): string {
+    const d = this.store.data;
+    if (P.kind === 'android') {
+      if (this.link.linked)
+        return `<h3>Связь с ПК</h3><div class="card"><div><b>Связан с ${esc(d.sync.pcName ?? 'ПК')}</b></div>
+          <div class="muted">${esc(d.sync.host ?? '')} · последняя синхронизация: ${d.sync.lastSync ? ago(d.sync.lastSync) : 'ещё не было'}</div>
+          ${d.sync.lastError && this.link.status.state === 'error' ? `<div class="err">${esc(d.sync.lastError)}</div>` : ''}
+          <div class="row"><button class="pill" data-act="sync">Синхронизировать</button><button class="pill ghost" data-act="unlink">Отвязать</button></div></div>
+          <p class="muted small">Через связь приходят записи, сессии Claude Code с ПК, а разговор может идти мозгом ПК (⚙ → «Мозг»).</p>`;
+      return `<h3>Связь с ПК</h3><div class="card"><p>Откройте Тук на ПК → ⚙ → «Связь» — там QR-код. ПК и телефон должны быть в одной сети Wi-Fi.</p>
+          <button class="pill big" data-act="scan">Сканировать QR-код с ПК</button>
+          <p class="muted">Или по коду из 6 цифр:</p>
+          <button class="pill ghost" data-act="discover">Найти ПК в сети</button>
+          ${this.found.map((f) => `<button class="found" data-act="pick" data-id="${f.id}">${esc(f.name)} · ${f.ip}</button>`).join('')}
+          <div class="row"><input id="pair-ip" inputmode="decimal" placeholder="IP ПК, например 192.168.1.5" value="${esc(this.found[0]?.ip ?? '')}"><input id="pair-pin" inputmode="numeric" maxlength="7" placeholder="Код"></div>
+          <button class="pill" data-act="pair-pin">Связать</button></div>`;
+    }
+    const peers = d.sync.peers ?? [];
+    return `<h3>Связь с телефоном</h3><div class="card qr-card"><div id="qr" class="qr"></div>
+        <div><p>На телефоне: Тук → ⚙ → «Связь» → <b>«Сканировать QR-код с ПК»</b>.</p><p class="muted" id="qr-ip"></p>
+        <p class="muted">Нет камеры? Нажмите «Код из 6 цифр» и введите его на телефоне.</p>
+        <button class="pill ghost" data-act="pin">Код из 6 цифр</button><div id="pin-box"></div></div></div>
+        ${peers.length ? `<h4>Связанные устройства</h4><ul>${peers.map((p) => `<li class="item"><span class="dot"></span><div class="body"><div class="t">${esc(p.name)}</div><div class="m">был на связи ${ago(p.lastSeen)}</div></div></li>`).join('')}</ul><button class="pill ghost" data-act="reset-key">Отвязать все устройства</button>` : ''}
+        ${P.kind === 'web' ? '<p class="muted">В демо в браузере QR-код показан для примера — связь работает только в приложении.</p>' : ''}`;
+  }
+
+  setAgentsHtml(): string {
+    const st = this.store.data.settings;
+    let h = '<h3>Claude Code и другие агенты</h3>';
+    if (P.kind === 'desktop')
+      h += `<div class="card">${this.claudeHooks ? '<b>Подключён.</b> <span class="muted">Сессии, шаги, правки, разрешения и вопросы — во вкладке «Агенты», на ПК и на телефоне.</span>' : '<span class="muted">Тук будет показывать каждую сессию Claude Code своим цветом, просить разрешения и отвечать на вопросы прямо в строке — на ПК и на телефоне.</span>'}
+      <div class="row">${this.claudeHooks ? '<button class="pill ghost small" data-act="claude-off">Отключить</button>' : '<button class="pill small" data-act="claude-on">Подключить Claude Code</button>'}<button class="pill ghost small" data-act="tab" data-id="agents">Открыть вкладку «Агенты»</button></div>
+      <p class="muted small">Тук добавит свои хуки в ~/.claude/settings.json и сохранит копию файла. Ваши настройки не меняются.</p></div>
+      <label class="toggle"><input type="checkbox" id="set-agentclean" ${st.agentAutoClean !== false ? 'checked' : ''}> Убирать закончившие сессии через 30 мин и молчащие — через час</label>
+      <p class="muted small">Другие агенты (Codex, Gemini CLI…) появляются своей пилюлей, если их хук добавляет в событие поле <code>"tuk_agent": "codex"</code> и вызывает <code>Tuk.exe --hook</code>.</p>`;
+    else h += `<p class="muted">${this.link.linked ? 'Сессии Claude Code с ПК видны во вкладке «Агенты». Разрешение подтверждается отпечатком пальца.' : 'Свяжите телефон с ПК (раздел «Связь») — и сможете разрешать действия Claude Code и отвечать на его вопросы с телефона.'}</p>`;
+    const rules = this.store.data.agentRules ?? [];
+    if (rules.length)
+      h += `<h4>Разрешено всегда</h4><ul>${rules.map((r, i) => `<li class="item"><span class="dot"></span><div class="body"><div class="t">${esc(r.tool)}</div><div class="m">в проекте «${esc(r.project)}»</div></div><button class="x" data-act="rule-del" data-id="${i}" aria-label="Убрать правило">×</button></li>`).join('')}</ul>`;
+    h += '<div class="row"><button class="pill ghost small" data-act="demo-start">Посмотреть демо</button></div>';
+    return h;
+  }
+
+  setDeviceHtml(): string {
+    const st = this.store.data.settings;
+    if (P.kind === 'desktop')
+      return `<h3>Музыка</h3>
       <label class="toggle"><input type="checkbox" id="set-dance" ${st.dance ? 'checked' : ''}> Танцевать под музыку</label>
       <p class="muted small">Тук видит, что играет в Spotify, Яндекс Музыке, браузере и других плеерах Windows, и управляет ими из строки.</p>
-      <h3>Claude Code</h3>
-      <div class="card">${this.claudeHooks ? '<b>Подключён.</b> <span class="muted">Шаги и запросы разрешений — во вкладке «Агенты», на ПК и на телефоне.</span>' : '<span class="muted">Тук будет показывать, что делает Claude Code, и просить разрешения прямо в строке — на ПК и на телефоне.</span>'}
-      <div class="row">${this.claudeHooks ? '<button class="pill ghost small" data-act="claude-off">Отключить</button>' : '<button class="pill small" data-act="claude-on">Подключить Claude Code</button>'}</div>
-      <p class="muted small">Тук добавит свои хуки в ~/.claude/settings.json и сохранит копию файла. Ваши настройки не меняются.</p></div>` : ''}
-      ${P.kind === 'android' ? `<h3>Тук над приложениями</h3>
+      <h3>Команды компьютеру</h3><p class="muted small">«открой калькулятор», «найди в интернете …», «маршрут до …», «поставь таймер на 5 минут», «будильник на 7:00», «следующий трек».</p>`;
+    if (P.kind === 'android')
+      return `<h3>Тук над приложениями</h3>
       <div class="card">${st.island && this.islandOn ? '<b>Включён.</b> <span class="muted">Тук живёт вверху экрана, вокруг камеры. Нажатие — выпадающее окно, долгое нажатие — всё приложение.</span>' : '<span class="muted">Маленький анимированный Тук вверху экрана поверх любых приложений. Нажали — открылось небольшое окно: голос, записи, дела на сегодня.</span>'}
       <div class="row">${st.island && this.islandOn ? '<button class="pill ghost small" data-act="island-off">Убрать</button>' : '<button class="pill small" data-act="island-on">Включить</button>'}</div>
       <p class="muted small">Нужно разрешение «Поверх других приложений». В шторке появится тихое уведомление «Тук рядом» — так Android не выгружает Тука.</p></div>
@@ -2187,13 +2773,24 @@ class App {
       ${this.wakeHtml()}
       <h3>Голос</h3>
       <label class="toggle"><input type="checkbox" id="set-voiceloop" ${st.voiceLoop !== false ? 'checked' : ''}> Продолжать разговор после ответа</label>
-      <p class="muted small">Нажмите 🎤 и говорите. Без интернета распознавание работает, если скачан русский язык: Настройки → Общие настройки → Язык и ввод → Распознавание речи (или Google → Офлайн-распознавание). Голос Тука — системный синтез речи.</p>` : ''}
-      <h3>Сводка</h3>
-      <button class="pill ghost" data-act="recap">Сводка за неделю</button>
-      ${P.kind === 'desktop' ? `<label class="toggle"><input type="checkbox" id="set-autostart" ${st.autostart ? 'checked' : ''}> Запускать вместе с Windows</label><p class="muted">Открыть строку: Ctrl+Alt+Пробел. Свернуть: Esc.</p>` : ''}
-      <h3>Состояния персонажа</h3><div class="moods-demo">${moods}</div>
-      ${P.kind === 'desktop' ? '<button class="pill ghost" data-act="quit">Выйти из Тука</button>' : ''}
-      <p class="muted small">Тук · версия 0.1 · всё хранится только на ваших устройствах</p>`;
+      <p class="muted small">Нажмите 🎤 и говорите. Без интернета распознавание работает, если скачан русский язык: Настройки → Общие настройки → Язык и ввод → Распознавание речи.</p>`;
+    return '<p class="muted">В браузере управление устройством недоступно — это демо. В приложении здесь музыка, остров, голос и команды телефону.</p>';
+  }
+
+  setHelpHtml(): string {
+    const can: [string, string][] = [
+      ['Записи', '«напомни завтра в 9 позвонить», «каждый день в 21 таблетки», «запиши купить кабель», «заметка: щит 600×800»'],
+      ['Здоровье', '«давление 125 на 80 пульс 70», «спал 7 часов», «выпил стакан воды»'],
+      ['Файлы', '📎 или перетащить: txt, md, csv, json, log, xml, yaml, ini, srt, PDF, Word, Excel, PowerPoint, картинки — несколько сразу. Спросить, в заметки, в задачи'],
+      ['Разговор', 'встроенный мозг без интернета или Ollama / LM Studio'],
+      ['Агенты', 'сессии Claude Code своим цветом, разрешения, ответы на вопросы, с ПК и с телефона'],
+      ['Команды', P.kind === 'android' ? 'будильник, таймер, звонок, сообщение, фонарик, громкость, яркость, «Не беспокоить», маршрут' : 'открыть программу или сайт, таймер, будильник, маршрут, поиск, музыка'],
+      ['Связь', 'ПК ↔ телефон по Wi-Fi, шифрование, без облака'],
+    ];
+    return `<h3>Посмотреть без настройки</h3><div class="card"><span class="muted">Демо покажет две параллельные сессии Claude Code, разрешение, вопрос с вариантами, файл и все состояния персонажа. Ничего не сохраняется.</span>
+      <div class="row">${this.demo ? '<button class="pill ghost small" data-act="demo-stop">Выйти из демо</button>' : '<button class="pill small" data-act="demo-start">Запустить демо</button>'}<button class="pill ghost small" data-act="onboard-open">Знакомство заново</button><button class="pill ghost small" data-act="shortcuts">Горячие клавиши</button></div></div>
+      <h3>Что я умею</h3><ul class="can">${can.map(([t, d]) => `<li><b>${t}</b><span>${esc(d)}</span></li>`).join('')}</ul>
+      ${this.examplesHtml()}`;
   }
 }
 

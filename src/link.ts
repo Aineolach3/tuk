@@ -26,6 +26,9 @@ export class Link {
   /** ПК: состояние агентов для телефона и решение по разрешению. */
   agentsHandler: (() => unknown) | null = null;
   decideHandler: ((reqId: number, d: 'allow' | 'deny' | 'always') => boolean) | null = null;
+  /** ПК: ответ на вопрос агента (AskUserQuestion) и закрытие сессии — с телефона. */
+  answerHandler: ((reqId: number, answers: Record<string, string | string[]>) => boolean) | null = null;
+  closeHandler: ((sessionId: string) => boolean) | null = null;
 
   constructor(private store: Store) {}
 
@@ -84,6 +87,16 @@ export class Link {
       if (req.path === '/agent-decide') {
         const { payload } = await open<{ reqId: number; d: 'allow' | 'deny' | 'always' }>(d.sync.key!, req.body);
         const ok = this.decideHandler?.(payload.reqId, payload.d) ?? false;
+        return P.serverReply(req.id, 200, await seal(d.sync.key!, d.deviceId, { ok }));
+      }
+      if (req.path === '/agent-answer') {
+        const { payload } = await open<{ reqId: number; answers: Record<string, string | string[]> }>(d.sync.key!, req.body);
+        const ok = this.answerHandler?.(payload.reqId, payload.answers) ?? false;
+        return P.serverReply(req.id, 200, await seal(d.sync.key!, d.deviceId, { ok }));
+      }
+      if (req.path === '/agent-close') {
+        const { payload } = await open<{ sessionId: string }>(d.sync.key!, req.body);
+        const ok = this.closeHandler?.(payload.sessionId) ?? false;
         return P.serverReply(req.id, 200, await seal(d.sync.key!, d.deviceId, { ok }));
       }
       if (req.path === '/chat') {
@@ -208,6 +221,20 @@ export class Link {
   async sendDecision(reqId: number, dec: 'allow' | 'deny' | 'always'): Promise<boolean> {
     const d = this.store.data, s = d.sync;
     const body = await P.httpPost(s.host!, s.port ?? SYNC_PORT, '/agent-decide', await seal(s.key!, d.deviceId, { reqId, d: dec }));
+    return (await open<{ ok: boolean }>(s.key!, body)).payload.ok;
+  }
+
+  /** Телефон: ответить на вопрос агента. */
+  async sendAnswer(reqId: number, answers: Record<string, string | string[]>): Promise<boolean> {
+    const d = this.store.data, s = d.sync;
+    const body = await P.httpPost(s.host!, s.port ?? SYNC_PORT, '/agent-answer', await seal(s.key!, d.deviceId, { reqId, answers }));
+    return (await open<{ ok: boolean }>(s.key!, body)).payload.ok;
+  }
+
+  /** Телефон: закрыть сессию агента на ПК. */
+  async sendClose(sessionId: string): Promise<boolean> {
+    const d = this.store.data, s = d.sync;
+    const body = await P.httpPost(s.host!, s.port ?? SYNC_PORT, '/agent-close', await seal(s.key!, d.deviceId, { sessionId }));
     return (await open<{ ok: boolean }>(s.key!, body)).payload.ok;
   }
 

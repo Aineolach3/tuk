@@ -42,6 +42,9 @@ export interface Settings {
   wake?: boolean; // Android: слушать «Тук Тук»
   voicePreset?: string; // живой голос: tuk | bright | boy | calm | '' (системный)
   voiceLoop?: boolean; // продолжать разговор голосом после ответа
+  onboarded?: boolean; // первый запуск пройден (3 шага: питомец, хоткей, мозг)
+  localAi?: import('./localai.js').LocalAi; // мозг из Ollama / LM Studio на этом ПК или в домашней сети
+  agentAutoClean?: boolean; // убирать закончившие и зависшие сессии сами (по умолчанию да)
 }
 
 export interface Data {

@@ -189,6 +189,8 @@ export class AgentHub {
   pending: Pending[] = [];
   onChange: () => void = () => {};
   onEvent: (e: HubEvent) => void = () => {};
+  /** Убирать закончившие и зависшие сессии самим (ждущие запросы уходят по таймауту всегда). */
+  autoClean = true;
   /** Полный вход инструмента для ответа на вопрос — на телефон не уходит. */
   private inputs = new Map<number, any>();
 
@@ -410,7 +412,7 @@ export class AgentHub {
         changed = true;
       }
       const ttl = s.status === 'ended' ? TIMEOUTS.endedRemove : s.status === 'done' || s.status === 'error' ? TIMEOUTS.doneRemove : s.status === 'stale' ? TIMEOUTS.staleRemove : Infinity;
-      if (quiet >= ttl) {
+      if (this.autoClean && quiet >= ttl) {
         this.sessions.delete(s.id);
         changed = true;
       }
